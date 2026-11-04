@@ -20,6 +20,8 @@ from PySide6.QtCore import QPoint, QPointF, QRectF, QVariantAnimation, QEasingCu
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QRadialGradient, QLinearGradient, QCursor, QMouseEvent
 
 from config import ACCENT, TEXT_MAIN, TEXT_SUB, BTN_DANGER, BG_HOVER, BG_MAIN
+import icons
+from icons import ICON_COLOR, ICON_MUTED, ICON_ACCENT, ICON_DANGER
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
 class ProfileWidget(QFrame):
@@ -123,19 +125,19 @@ class ProfileWidget(QFrame):
     def show_menu(self, pos):
         from config import BUILTIN_PRESETS
         menu = QMenu(self)
-        a_bind = QAction(QIcon(os.path.join(ASSETS_DIR, "setting.svg")), "Прив'язати до .exe", self)
-        a_ren = QAction(QIcon(os.path.join(ASSETS_DIR, "rename.svg")), "Перейменувати", self)
-        a_exp = QAction("📤 Експорт профілю (.json)", self)
-        a_imp = QAction("📥 Імпорт профілю (.json)", self)
+        a_bind = QAction(icons.icon("link", ICON_COLOR), "Прив'язати до .exe", self)
+        a_ren = QAction(icons.icon("rename", ICON_COLOR), "Перейменувати", self)
+        a_exp = QAction(icons.icon("export", ICON_COLOR), "Експорт профілю (.json)", self)
+        a_imp = QAction(icons.icon("import", ICON_COLOR), "Імпорт профілю (.json)", self)
 
-        preset_menu = menu.addMenu("✨ Завантажити пресет...")
+        preset_menu = menu.addMenu(icons.icon("sparkles", ICON_ACCENT), "Завантажити пресет...")
         preset_actions = {}
         for p_name in BUILTIN_PRESETS.keys():
-            act_p = preset_menu.addAction(f"⚡ {p_name}")
+            act_p = preset_menu.addAction(icons.icon("layers", ICON_MUTED), p_name)
             preset_actions[act_p] = p_name
 
-        a_clear = QAction(QIcon(os.path.join(ASSETS_DIR, "clean.svg")), "Очистити призначення", self)
-        a_del = QAction(QIcon(os.path.join(ASSETS_DIR, "trash.svg")), "Видалити профіль", self)
+        a_clear = QAction(icons.icon("eraser", ICON_COLOR), "Очистити призначення", self)
+        a_del = QAction(icons.icon("trash", ICON_DANGER), "Видалити профіль", self)
         a_del.setObjectName("danger")
 
         menu.addAction(a_bind)
@@ -318,7 +320,7 @@ class OSDOverlay(QWidget):
         self.mode = "status"
         self.title = ""
         self.val = 0.0
-        self.icon_text = "🔊"
+        self.icon_text = "volume"
         self.app_icon = None
         self.is_danger = False
 
@@ -330,7 +332,7 @@ class OSDOverlay(QWidget):
         self.anim.setDuration(180)
         self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
-    def show_osd(self, mode, title, val=0.0, icon_text="🔊", is_danger=False, app_icon=None):
+    def show_osd(self, mode, title, val=0.0, icon_text="volume", is_danger=False, app_icon=None):
         if not self.main_app.config.get("show_osd", True):
             return
         self.mode = mode
@@ -395,6 +397,8 @@ class OSDOverlay(QWidget):
         if self.app_icon and not self.app_icon.isNull():
             pix = self.app_icon.pixmap(26, 26)
             p.drawPixmap(int(icon_rect.center().x() - 13), int(icon_rect.center().y() - 13), pix)
+        elif icons.has_icon(self.icon_text):
+            icons.paint_icon(p, self.icon_text, icon_rect.adjusted(9, 9, -9, -9), border_col.name())
         else:
             p.setPen(QColor("#ffffff"))
             p.setFont(QFont("Segoe UI Emoji", 16))
@@ -597,11 +601,11 @@ class EncoderCompoundWidget(QWidget):
                 add_mode_act = None
                 clear_modes_act = None
                 if part == "center" and self.main_app.staged_val and self.main_app.staged_val.startswith("ENC:"):
-                    add_mode_act = menu.addAction(f"➕ Додати «{self.main_app.staged_name}» у Smart Dial")
+                    add_mode_act = menu.addAction(icons.icon("plus", ICON_ACCENT), f"Додати «{self.main_app.staged_name}» у Smart Dial")
                 if part == "center":
-                    clear_modes_act = menu.addAction("🔄 Очистити додаткові режими крутилки")
+                    clear_modes_act = menu.addAction(icons.icon("eraser", ICON_COLOR), "Очистити додаткові режими крутилки")
                     menu.addSeparator()
-                del_act = QAction("🗑 Видалити призначення", self)
+                del_act = QAction(icons.icon("trash", ICON_DANGER), "Видалити призначення", self)
                 del_act.setObjectName("danger")
                 menu.addAction(del_act)
                 action = menu.exec(event.globalPosition().toPoint())
@@ -944,12 +948,17 @@ class FloatingDragOverlay(QWidget):
         p.setPen(border_pen)
         p.drawRoundedRect(card_rect, radius, radius)
 
-        # 4. Неонова енерго-крапка
+        # 4. Іконка дії (або неонова крапка, якщо іконки немає)
         dot_x = card_rect.left() + 14
         dot_y = card_rect.center().y()
-        p.setBrush(QColor(ACCENT))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(dot_x, dot_y), 3.5, 3.5)
+        icon_name = icons.action_icon_name(self.action_val)
+        if icon_name:
+            icons.paint_icon(p, icon_name, QRectF(dot_x - 7, dot_y - 7, 14, 14), ACCENT)
+            dot_x += 4
+        else:
+            p.setBrush(QColor(ACCENT))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QPointF(dot_x, dot_y), 3.5, 3.5)
 
         # 5. Текст дії
         p.setFont(QFont("Arial", 9, QFont.Weight.Bold))
@@ -961,7 +970,7 @@ class FloatingDragOverlay(QWidget):
         p.end()
 
 class DraggableActionButton(QPushButton):
-    def __init__(self, text, val, main_app, parent=None):
+    def __init__(self, text, val, main_app, parent=None, icon_name=None):
         super().__init__(text, parent)
         self.val = val
         self.main_app = main_app
@@ -969,12 +978,28 @@ class DraggableActionButton(QPushButton):
         self.is_dragging = False
         self.setObjectName("actionBtn")
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        # Іконка: явно задана або підібрана за типом дії (той самий набір, що й в OSD)
+        self._icon_name = icon_name or icons.action_icon_name(val)
+        self._custom_icon = None
+        self.setIconSize(QSize(18, 18))
+        self.set_icon_staged(False)
         
         self.ghost_alpha = 255
         self.ghost_anim = QVariantAnimation(self)
         self.ghost_anim.setDuration(160)
         self.ghost_anim.setEasingCurve(QEasingCurve.Type.OutQuad)
         self.ghost_anim.valueChanged.connect(self._update_ghost)
+
+    def set_custom_icon(self, qicon):
+        """Власна іконка (напр. іконка .exe-файлу) замість іконки з набору."""
+        self._custom_icon = qicon
+        self.setIcon(qicon)
+
+    def set_icon_staged(self, staged):
+        if self._custom_icon is not None:
+            return
+        if self._icon_name:
+            self.setIcon(icons.icon(self._icon_name, ICON_ACCENT if staged else ICON_COLOR))
 
     def _update_ghost(self, val):
         self.ghost_alpha = val
@@ -1082,7 +1107,7 @@ class DraggableActionButton(QPushButton):
                                     btn.trigger_pulse(pulse_targets)
                                 if err_msg and hasattr(self.main_app, 'tooltip'):
                                     pos = btn.mapToGlobal(QPoint(btn.width() // 2, 0))
-                                    self.main_app.tooltip.show_text(f"❌ {err_msg}", pos, "top")
+                                    self.main_app.tooltip.show_text(f"✕ {err_msg}", pos, "top")
                                     QTimer.singleShot(1800, self.main_app.tooltip.hide_tip)
                             else:
                                 if hasattr(self.main_app, 'drag_overlay'):
@@ -1104,7 +1129,7 @@ class DraggableActionButton(QPushButton):
                             btn.trigger_pulse(BTN_DANGER)
                             if hasattr(self.main_app, 'tooltip'):
                                 pos = btn.mapToGlobal(QPoint(btn.width() // 2, 0))
-                                self.main_app.tooltip.show_text("❌ Тільки для енкодерів (Центр)", pos, "top")
+                                self.main_app.tooltip.show_text("✕ Тільки для енкодерів (Центр)", pos, "top")
                                 QTimer.singleShot(1800, self.main_app.tooltip.hide_tip)
                         else:
                             if hasattr(self.main_app, 'drag_overlay'):
@@ -1219,7 +1244,7 @@ class PadButton(QPushButton):
             self.leftClicked.emit(self.bid)
         elif event.button() == Qt.MouseButton.RightButton:
             menu = QMenu(self)
-            del_act = QAction("🗑 Видалити призначення", self)
+            del_act = QAction(icons.icon("trash", ICON_DANGER), "Видалити призначення", self)
             del_act.setObjectName("danger")
             menu.addAction(del_act)
             action = menu.exec(event.globalPosition().toPoint())
@@ -1488,16 +1513,18 @@ class ActionWidget(QPushButton):
     def show_menu(self):
         self.unhook_if_listening()
         menu = QMenu(self)
-        a_tap = menu.addAction("Натиснути і відпустити")
-        a_press = menu.addAction("Затиснути клавішу")
-        a_release = menu.addAction("Відпустити клавішу")
-        a_hotkey = menu.addAction("Комбінація (швидко)")
-        a_text = menu.addAction("Ввести текст")
-        a_move = menu.addAction("📍 Перемістити курсор (X, Y)")
+        a_tap = menu.addAction(icons.icon("tap", ICON_COLOR), "Натиснути і відпустити")
+        a_press = menu.addAction(icons.icon("download", ICON_COLOR), "Затиснути клавішу")
+        a_release = menu.addAction(icons.icon("export", ICON_COLOR), "Відпустити клавішу")
+        a_hotkey = menu.addAction(icons.icon("keyboard", ICON_COLOR), "Комбінація (швидко)")
+        a_text = menu.addAction(icons.icon("type", ICON_COLOR), "Ввести текст")
+        a_move = menu.addAction(icons.icon("cursor", ICON_COLOR), "Перемістити курсор (X, Y)")
         menu.addSeparator()
 
         del_action = QWidgetAction(menu)
-        del_btn = QPushButton("🗑 Видалити блок")
+        del_btn = QPushButton("Видалити блок")
+        del_btn.setIcon(icons.icon("trash", ICON_DANGER, active="#ffffff"))
+        del_btn.setIconSize(QSize(16, 16))
         del_btn.setStyleSheet("""
             QPushButton {
                 background-color: transparent; color: #fff; text-align: left;
@@ -1636,6 +1663,10 @@ class PlusButton(QPushButton):
 class MacroEditor(QFrame):
     stop_record_sig = Signal(bool)
 
+    _REC_IDLE_STYLE = ("QPushButton { background-color: transparent; border: 1px solid #ff3366; color: #ff3366; border-radius: 4px; "
+                       "font-size: 12px; font-weight: bold; padding: 0px 10px; } "
+                       "QPushButton:hover { background-color: rgba(255, 51, 102, 0.15); }")
+
     def __init__(self, main_app, parent=None):
         super().__init__(parent)
         self.main_app = main_app
@@ -1685,12 +1716,11 @@ class MacroEditor(QFrame):
         self.bottom_lay = QHBoxLayout()
         self.bottom_lay.setContentsMargins(5, 0, 0, 0)
 
-        self.btn_record = QPushButton("⬤ Авто-запис дій")
-        self.btn_record.setFixedSize(150, 32)
-        self.btn_record.setStyleSheet("""
-            QPushButton { background-color: transparent; border: 1px solid #ff3366; color: #ff3366; border-radius: 4px; font-size: 12px; font-weight: bold; padding: 0px 10px; }
-            QPushButton:hover { background-color: #ff3366; color: white; }
-        """)
+        self.btn_record = QPushButton("Авто-запис дій")
+        self.btn_record.setFixedSize(160, 32)
+        self.btn_record.setIconSize(QSize(14, 14))
+        self.btn_record.setIcon(icons.icon("record", ICON_DANGER))
+        self.btn_record.setStyleSheet(self._REC_IDLE_STYLE)
         self.btn_record.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_record.clicked.connect(self.toggle_record)
 
@@ -1793,7 +1823,8 @@ class MacroEditor(QFrame):
 
     def start_recording(self):
         self.is_recording = True
-        self.btn_record.setText("⏹ Зупинити (Esc)")
+        self.btn_record.setText("Зупинити (Esc)")
+        self.btn_record.setIcon(icons.icon("stop", "#ffffff"))
         self.btn_record.setStyleSheet("QPushButton { background-color: #ff3366; border: 1px solid #ff3366; color: white; border-radius: 4px; font-size: 12px; font-weight: bold; padding: 0px 10px; }")
         self.lbl_record_status.setText("Запис... Натисніть Esc для зупинки.")
         self.lbl_record_status.setStyleSheet("color: #ff3366; font-size: 11px;")
@@ -1826,8 +1857,9 @@ class MacroEditor(QFrame):
         except Exception:
             pass
 
-        self.btn_record.setText("⬤ Авто-запис дій")
-        self.btn_record.setStyleSheet("QPushButton { background-color: transparent; border: 1px solid #ff3366; color: #ff3366; border-radius: 4px; font-size: 12px; font-weight: bold; padding: 0px 10px; } QPushButton:hover { background-color: #ff3366; color: white; }")
+        self.btn_record.setText("Авто-запис дій")
+        self.btn_record.setIcon(icons.icon("record", ICON_DANGER))
+        self.btn_record.setStyleSheet(self._REC_IDLE_STYLE)
         self.lbl_record_status.setText("")
 
         if self.recorded_events:
@@ -2116,7 +2148,7 @@ class VirtualKeyboard(QFrame):
         self.combo_mouse = QComboBox()
         # Додано пункти прокрутки 6 та 7:
         self.combo_mouse.addItems([
-            "🖱 Кнопки миші...", 
+            "Кнопки миші...", 
             "Ліва (LMB)", 
             "Права (RMB)", 
             "Середня (MMB)", 
@@ -2125,6 +2157,7 @@ class VirtualKeyboard(QFrame):
             "Колесо вгору (Scroll Up)",
             "Колесо вниз (Scroll Down)"
         ])
+        self.combo_mouse.setItemIcon(0, icons.icon("mouse", ICON_COLOR))
         self.combo_mouse.setFixedSize(306, 40)
         self.combo_mouse.setStyleSheet("QComboBox { background: #1a1a1a; color: #fff; border: 1px dashed #555; border-radius: 6px; font-weight: bold; padding: 5px 10px; } QComboBox:hover { border: 1px solid #00e5ff; }")
         self.combo_mouse.activated.connect(self.handle_mouse_combo)
@@ -2235,7 +2268,7 @@ class MultiLaunchEditor(QFrame):
         self.lbl_title.setWordWrap(True)
         
         btn_close = QPushButton("")
-        btn_close.setIcon(QIcon(os.path.join(ASSETS_DIR, "close.svg")))
+        btn_close.setIcon(icons.icon("close", ICON_COLOR, active=ICON_DANGER))
         btn_close.setIconSize(QSize(16, 16))
         btn_close.setFixedSize(30, 30)
         btn_close.setStyleSheet("QPushButton { background: transparent; border: none; } QPushButton:hover { background: rgba(255, 51, 102, 0.15); border-radius: 4px; }")
@@ -2259,7 +2292,9 @@ class MultiLaunchEditor(QFrame):
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(8)
         
-        self.btn_add = QPushButton("➕ Додати елемент")
+        self.btn_add = QPushButton("Додати елемент")
+        self.btn_add.setIcon(icons.icon("plus", ICON_COLOR))
+        self.btn_add.setIconSize(QSize(16, 16))
         self.btn_add.setFixedHeight(40)
         self.btn_add.setStyleSheet(f"QPushButton {{ background-color: {BG_HOVER}; border: 1px dashed #555; color: {TEXT_MAIN}; border-radius: 5px; font-weight: bold; }} QPushButton:hover {{ border: 1px solid {ACCENT}; color: {ACCENT}; }}")
         self.btn_add.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -2340,8 +2375,7 @@ class MultiLaunchEditor(QFrame):
             lbl_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
             
             if is_url:
-                lbl_icon.setText("🌐")
-                lbl_icon.setStyleSheet("border: none; background: transparent; font-size: 16px;")
+                lbl_icon.setPixmap(icons.pixmap("globe", 20, ICON_COLOR))
             else:
                 path = val_clean
                 val_clean = path.replace("\\", "/").split("/")[-1]
@@ -2349,8 +2383,10 @@ class MultiLaunchEditor(QFrame):
                     icon = self.main_app.icon_provider.icon(QFileInfo(path))
                     lbl_icon.setPixmap(icon.pixmap(24, 24))
                 else:
-                    lbl_icon.setText("📁" if "." not in val_clean else "❓")
-                    lbl_icon.setStyleSheet("border: none; background: transparent; font-size: 16px;")
+                    # файл/папку не знайдено — показуємо приглушену іконку
+                    lbl_icon.setPixmap(icons.pixmap("folder" if "." not in val_clean else "warning", 20,
+                                                    ICON_MUTED if "." not in val_clean else ICON_DANGER))
+                    lbl_icon.setToolTip("Шлях не знайдено")
             
             lbl_text = QLabel(val_clean)
             lbl_text.setStyleSheet("border: none; background: transparent; color: #ddd; font-weight: bold;")
@@ -2381,7 +2417,7 @@ class MultiLaunchEditor(QFrame):
                 lbl_sec.setStyleSheet("color: #777; font-size: 12px; background: transparent; border: none;")
             
             btn_del = QPushButton("")
-            btn_del.setIcon(QIcon(os.path.join(ASSETS_DIR, "trash.svg")))
+            btn_del.setIcon(icons.icon("trash", ICON_MUTED))
             btn_del.setIconSize(QSize(18, 18))
             btn_del.setFixedSize(26, 26)
             btn_del.setStyleSheet(f"QPushButton {{ background: transparent; border: none; border-radius: 4px; }} QPushButton:hover {{ background: rgba(255, 51, 102, 0.2); }}")
@@ -2404,9 +2440,9 @@ class MultiLaunchEditor(QFrame):
 
     def show_add_menu(self):
         menu = QMenu(self)
-        a_exe = menu.addAction("📄 Додати програму (.exe)")
-        a_folder = menu.addAction("📁 Додати папку")
-        a_url = menu.addAction("🌐 Додати посилання (URL)")
+        a_exe = menu.addAction(icons.icon("app", ICON_COLOR), "Додати програму (.exe)")
+        a_folder = menu.addAction(icons.icon("folder", ICON_COLOR), "Додати папку")
+        a_url = menu.addAction(icons.icon("globe", ICON_COLOR), "Додати посилання (URL)")
         
         action = menu.exec(self.btn_add.mapToGlobal(self.btn_add.rect().bottomLeft()))
         if action == a_exe:
@@ -2464,7 +2500,7 @@ class InfoButton(QPushButton):
         """)
 
 class InfoPopup(QWidget):
-    def __init__(self, text, btn_text, callback, parent=None):
+    def __init__(self, text, btn_text, callback, parent=None, icon_name=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -2483,6 +2519,9 @@ class InfoPopup(QWidget):
         flay.addWidget(lbl)
         
         btn = QPushButton(btn_text)
+        if icon_name:
+            btn.setIcon(icons.icon(icon_name, ICON_COLOR))
+            btn.setIconSize(QSize(16, 16))
         btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn.setStyleSheet("""
             QPushButton {
@@ -2506,13 +2545,17 @@ class TutorialControls(QFrame):
         lay.setContentsMargins(15, 15, 15, 15)
         lay.setSpacing(10)
         
-        btn_pdf = QPushButton("📄 Інструкція (PDF)")
+        btn_pdf = QPushButton("Інструкція (PDF)")
+        btn_pdf.setIcon(icons.icon("document", ICON_COLOR))
+        btn_pdf.setIconSize(QSize(16, 16))
         btn_pdf.setStyleSheet("QPushButton { background: #222; border: 1px solid #555; padding: 10px; border-radius: 4px; color: #fff; font-size: 13px; font-weight: bold; } QPushButton:hover { background: #00e5ff; color: #000; }")
         btn_pdf.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_pdf.clicked.connect(pdf_cb)
         lay.addWidget(btn_pdf)
         
-        btn_close = QPushButton("✖ Закрити підказки")
+        btn_close = QPushButton("Закрити підказки")
+        btn_close.setIcon(icons.icon("close", ICON_DANGER))
+        btn_close.setIconSize(QSize(12, 12))
         btn_close.setStyleSheet("QPushButton { background: transparent; border: 1px solid #ff3366; color: #ff3366; padding: 10px; border-radius: 4px; font-size: 13px; font-weight: bold;} QPushButton:hover { background: #ff3366; color: #fff; }")
         btn_close.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_close.clicked.connect(close_cb)

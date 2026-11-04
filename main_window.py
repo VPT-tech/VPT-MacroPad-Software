@@ -28,6 +28,9 @@ from utils import win_key_event, win_hotkey, get_app_path
 from threads import AudioScannerThread, SerialThread, WebSocketServerThread, MutePollerThread, ActiveWindowThread
 from widgets import *
 from action_executor import ActionExecutor
+import icons
+from icons import ICON_COLOR, ICON_MUTED, ICON_ACCENT, ICON_DANGER
+import html
 
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
@@ -173,7 +176,7 @@ class MacroPadPro(QMainWindow):
         """Потокобезпечний запит на перемикання профілю з будь-якого потоку."""
         self.profile_switch_signal.emit(int(idx), bool(from_hotkey), bool(is_temp_hold))
 
-    def trigger_osd(self, mode, title, val=0.0, icon_text="🔊", is_danger=False, app_exe=""):
+    def trigger_osd(self, mode, title, val=0.0, icon_text="volume", is_danger=False, app_exe=""):
         self.osd_signal.emit(mode, title, float(val), icon_text, bool(is_danger), app_exe or "")
 
     def _show_osd_slot(self, mode, title, val, icon_text, is_danger, app_exe):
@@ -268,13 +271,13 @@ class MacroPadPro(QMainWindow):
                 # Апаратний watchdog перезапустив плату після зависання. Прив'язки вже
                 # відновлено повною синхронізацією вище — лише повідомляємо користувача.
                 self.last_board_reset = time.strftime("%H:%M:%S")
-                tip += f"\n⚠ Плата перезапускалась після зависання (watchdog), {self.last_board_reset}"
+                tip += f"\nПлата перезапускалась після зависання (watchdog), {self.last_board_reset}"
                 msg = "Макропад перезапустився після зависання (watchdog). Налаштування відновлено."
                 try:
                     self.tray_icon.showMessage("VPT | Pad", msg, QSystemTrayIcon.MessageIcon.Warning, 6000)
                 except Exception:
                     pass
-                self.trigger_osd("status", "Плату перезапущено (watchdog)", is_danger=True, icon_text="⚠️")
+                self.trigger_osd("status", "Плату перезапущено (watchdog)", is_danger=True, icon_text="warning")
             self.lbl_status.setToolTip(tip)
         else:
             self._hw_shadow.clear()
@@ -289,8 +292,13 @@ class MacroPadPro(QMainWindow):
         self.bg_updater.update_found_signal.connect(self.show_update_button)
         self.bg_updater.start()
 
+    def _set_update_btn(self, text, icon_name=None, color=ICON_MUTED):
+        self.btn_update.setText(text)
+        self.btn_update.setIcon(icons.icon(icon_name, color) if icon_name else QIcon())
+        self.btn_update.setIconSize(QSize(18, 18))
+
     def show_update_button(self, version):
-        self.btn_update.setText(f"🚀 Доступна версія {version}!")
+        self._set_update_btn(f"Доступна версія {version}", "download", ICON_ACCENT)
         self.btn_update.setStyleSheet(f"""
             QPushButton {{ background-color: {BG_HOVER}; color: {ACCENT}; border: 1px solid {ACCENT}; border-radius: 5px; font-weight: bold; padding: 5px; }}
             QPushButton:hover {{ background-color: {ACCENT}; color: {BG_MAIN}; }}
@@ -302,7 +310,7 @@ class MacroPadPro(QMainWindow):
         if hasattr(self, 'updater') and self.updater.isRunning():
             return
 
-        self.btn_update.setText("⏳ Завантаження...")
+        self._set_update_btn("Завантаження...", "clock")
         self.btn_update.setDisabled(True)
 
         self.updater = UpdaterThread()
@@ -316,11 +324,11 @@ class MacroPadPro(QMainWindow):
             QTimer.singleShot(3000, lambda: self.reset_update_btn())
 
     def reset_update_btn(self):
-        self.btn_update.setText("🔄 Оновити ПЗ")
+        self._set_update_btn("Оновити ПЗ", "refresh")
         self.btn_update.setDisabled(False)
 
     def prompt_update(self, exe_path, uf2_path):
-        self.btn_update.setText("✅ Оновлення готове")
+        self._set_update_btn("Оновлення готове", "check", "#00ff66")
 
         msg = QMessageBox(self)
         msg.setWindowTitle("Оновлення доступне")
@@ -346,7 +354,7 @@ class MacroPadPro(QMainWindow):
 
     def apply_update(self, exe_path, uf2_path):
         if uf2_path and not updater_mod.is_verified(uf2_path):
-            self.lbl_status.setText("⚠ Прошивка не пройшла перевірку SHA-256")
+            self.lbl_status.setText("Прошивка не пройшла перевірку SHA-256")
             uf2_path = ""
         if uf2_path:
             self._flashing = True
@@ -383,7 +391,7 @@ class MacroPadPro(QMainWindow):
                     except Exception:
                         pass
 
-                    self.lbl_status.setText("Прошивку оновлено!" if flashed else "⚠ Прошивку не записано")
+                    self.lbl_status.setText("Прошивку оновлено!" if flashed else "Прошивку не записано")
                     if exe_path and os.path.exists(exe_path):
                         QTimer.singleShot(2000, lambda: self.run_exe_update(exe_path))
 
@@ -406,14 +414,14 @@ class MacroPadPro(QMainWindow):
         if not updater_mod.is_verified(exe_path):
             # Файл змінився після завантаження (або не мав контрольної суми) — з правами
             # адміністратора такий файл не запускаємо
-            self.btn_update.setText("⚠ Інсталятор не пройшов перевірку")
+            self._set_update_btn("Інсталятор не пройшов перевірку", "warning", ICON_DANGER)
             QTimer.singleShot(4000, self.reset_update_btn)
             return
         params = "/VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS"
         res = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, None, 1)
         if int(res) <= 32:
             # Користувач відхилив UAC або запуск не вдався — програма НЕ закривається
-            self.btn_update.setText("⚠ Оновлення скасовано")
+            self._set_update_btn("Оновлення скасовано", "warning", ICON_DANGER)
             QTimer.singleShot(3000, self.reset_update_btn)
             return
         self.quit_app()
@@ -701,7 +709,7 @@ class MacroPadPro(QMainWindow):
         self.enc_mode_indices[base_enc] = new_idx
         active_act = modes[new_idx]
         enc_num = base_enc.replace("ENC_", "")
-        self.trigger_osd("profile", f"Крутилка {enc_num}: {self.get_fname(active_act)}", icon_text="🎛")
+        self.trigger_osd("profile", f"Крутилка {enc_num}: {self.get_fname(active_act)}", icon_text="dial")
         self.sync_hardware_bindings(save_eeprom=False, immediate=True)
         if base_enc in self.ui_pad_btns:
             self.ui_pad_btns[base_enc].update()
@@ -709,17 +717,19 @@ class MacroPadPro(QMainWindow):
     def get_btn_tooltip(self, bid):
         tr = self.get_button_triggers(bid)
         parts = []
-        if tr["tap"] != "NONE": parts.append(f"👆 Клік: {self.get_fname(tr['tap'])}")
-        if tr["dtap"] != "NONE": parts.append(f"⚡ 2x Клік: {self.get_fname(tr['dtap'])}")
-        if tr["hold"] != "NONE": parts.append(f"⏳ Утримання: {self.get_fname(tr['hold'])}")
-        return "  |  ".join(parts)
+        # Кольори маркерів збігаються з точками на кнопках макета та кнопками режимів
+        for slot, label, color in (("tap", "Клік", "#ffffff"), ("dtap", "2x Клік", "#ffaa00"), ("hold", "Утримання", "#b366ff")):
+            if tr[slot] != "NONE":
+                parts.append(f"<span style='color:{color}'>●</span>&nbsp;{label}: {html.escape(self.get_fname(tr[slot]))}")
+        return "&nbsp;&nbsp;&nbsp;".join(parts)
 
     def get_enc_tooltip(self, base_enc):
         modes = self.get_enc_modes(base_enc)
         if len(modes) > 1:
             idx = self.enc_mode_indices.get(base_enc, 0) % len(modes)
-            names = [f"[{self.get_fname(m)}]" if i == idx else self.get_fname(m) for i, m in enumerate(modes)]
-            return "🎛 Smart Dial: " + " ➔ ".join(names)
+            names = [f"<b style='color:{ACCENT}'>{html.escape(self.get_fname(m))}</b>" if i == idx
+                     else html.escape(self.get_fname(m)) for i, m in enumerate(modes)]
+            return "Smart Dial: " + " ➔ ".join(names)
         val = self.get_action(base_enc)
         return self.get_fname(val) if val != "NONE" else ""
 
@@ -911,7 +921,7 @@ class MacroPadPro(QMainWindow):
         if from_hotkey:
             prof_name = profiles[idx].get("name", f"Профіль {idx + 1}")
             prefix = "Утримання шару" if is_temp_hold else "Профіль"
-            self.trigger_osd("profile", f"{prefix}: {prof_name}", icon_text="🔄")
+            self.trigger_osd("profile", f"{prefix}: {prof_name}", icon_text="layers" if is_temp_hold else "profile-goto")
 
     def get_fname(self, val):
         if not val or val == "NONE": return "НЕ ПРИЗНАЧЕНО"
@@ -984,8 +994,9 @@ class MacroPadPro(QMainWindow):
 
         self.yt_popup = InfoPopup(
             "Для керування YouTube потрібно встановити\nнаше розширення для браузера.",
-            "🌐 Скачати розширення",
-            open_store
+            "Скачати розширення",
+            open_store,
+            icon_name="download"
         )
         self.yt_popup.move(pos)
         self.yt_popup.show()
@@ -1107,9 +1118,11 @@ class MacroPadPro(QMainWindow):
     def set_trigger_mode(self, mode_key):
         self.current_trigger_type = mode_key
         colors = {"tap": ACCENT, "dtap": "#ffaa00", "hold": "#b366ff"}
+        trig_icons = {"tap": "tap", "dtap": "double-tap", "hold": "hold"}
         for k, btn in self.trigger_btns.items():
             is_act = (k == mode_key)
             col = colors[k]
+            btn.setIcon(icons.icon(trig_icons[k], col if is_act else ICON_MUTED))
             if is_act:
                 btn.setStyleSheet(f"QPushButton {{ background: rgba(0, 229, 255, 0.12); border: 1px solid {col}; color: {col}; font-size: 11px; font-weight: bold; border-radius: 5px; padding: 2px; }}")
             else:
@@ -1134,7 +1147,7 @@ class MacroPadPro(QMainWindow):
         header_lay = QHBoxLayout()
 
         self.btn_settings = QPushButton("")
-        self.btn_settings.setIcon(QIcon(os.path.join(ASSETS_DIR, "setting.svg")))
+        self.btn_settings.setIcon(icons.icon("settings", ICON_MUTED))
         self.btn_settings.setIconSize(QSize(22, 22))
         self.btn_settings.setFixedSize(32, 32)
         self.btn_settings.setStyleSheet("QPushButton { background: transparent; border: none; } QPushButton:hover { background: #1f1f1f; border-radius: 5px; }")
@@ -1149,7 +1162,7 @@ class MacroPadPro(QMainWindow):
         logo.setStyleSheet(f"color: {ACCENT};")
         header_lay.addWidget(logo)
 
-        self.lbl_status = QLabel("<font color='#888888'>⬤</font> Пошук...")
+        self.lbl_status = QLabel("<font color='#888888'>●</font> Пошук...")
         self.lbl_status.setFont(QFont("Arial", 11, QFont.Weight.Bold))
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         header_lay.addWidget(self.lbl_status)
@@ -1182,8 +1195,9 @@ class MacroPadPro(QMainWindow):
         trig_lay.setContentsMargins(0, 0, 0, 0)
         trig_lay.setSpacing(6)
         self.trigger_btns = {}
-        for t_key, t_label in [("tap", "👆 Клік (Tap)"), ("dtap", "⚡ Подвійний (2x)"), ("hold", "⏳ Утримання")]:
+        for t_key, t_label in [("tap", "Клік"), ("dtap", "Подвійний"), ("hold", "Утримання")]:
             tb = QPushButton(t_label)
+            tb.setIconSize(QSize(16, 16))
             tb.setFixedHeight(32)
             tb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             tb.clicked.connect(lambda checked, k=t_key: self.set_trigger_mode(k))
@@ -1274,7 +1288,9 @@ class MacroPadPro(QMainWindow):
         self.lbl_vkb_combo = QLabel("Ваша комбінація: [ Порожньо ]")
         self.lbl_vkb_combo.setStyleSheet(f"color: {ACCENT}; font-size: 16px; font-weight: bold;")
 
-        btn_vkb_clear = QPushButton("✖ Очистити")
+        btn_vkb_clear = QPushButton("Очистити")
+        btn_vkb_clear.setIcon(icons.icon("close", BTN_DANGER))
+        btn_vkb_clear.setIconSize(QSize(12, 12))
         btn_vkb_clear.setFixedSize(110, 32)
         btn_vkb_clear.setStyleSheet(f"background: transparent; color: {BTN_DANGER}; border: 1px solid {BTN_DANGER}; border-radius: 5px;")
         btn_vkb_clear.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -1327,7 +1343,9 @@ class MacroPadPro(QMainWindow):
         if hasattr(self, 'vkb_container'): self.vkb_container.raise_()
         if hasattr(self, 'profiles_scroll'): self.profiles_scroll.raise_()
 
-        self.btn_update = QPushButton("🔄 Оновити ПЗ", self.right_panel)
+        self.btn_update = QPushButton("Оновити ПЗ", self.right_panel)
+        self.btn_update.setIcon(icons.icon("refresh", ICON_MUTED))
+        self.btn_update.setIconSize(QSize(18, 18))
         self.btn_update.setFixedHeight(40)
         self.btn_update.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_update.setStyleSheet(f"""
@@ -1372,9 +1390,9 @@ class MacroPadPro(QMainWindow):
         lbl.setStyleSheet(f"color: {ACCENT}; font-weight: bold; margin-top: 15px; margin-bottom: 5px;")
         layout.addWidget(lbl)
 
-    def add_action(self, layout, text, val):
+    def add_action(self, layout, text, val, icon_name=None):
         from widgets import DraggableActionButton
-        b = DraggableActionButton(text, val, self)
+        b = DraggableActionButton(text, val, self, icon_name=icon_name)
         b.clicked.connect(lambda checked, t=text, v=val, btn=b: self.stage_action(t, v, btn))
         layout.addWidget(b)
         self.all_action_btns.append(b)
@@ -1385,17 +1403,18 @@ class MacroPadPro(QMainWindow):
         row = QHBoxLayout()
         b = DraggableActionButton(text, val, self)
         if icon and not icon.isNull():
-            b.setIcon(icon)
+            b.set_custom_icon(icon)
         b.clicked.connect(lambda checked, t=text, v=val, btn=b: self.stage_action(t, v, btn))
         row.addWidget(b, stretch=1)
         self.all_action_btns.append(b)
 
         del_b = QPushButton("")
-        del_b.setIcon(QIcon(os.path.join(ASSETS_DIR, "trash.svg")))
-        del_b.setIconSize(QSize(20, 20))
+        del_b.setIcon(icons.icon("trash", ICON_MUTED))
+        del_b.setIconSize(QSize(18, 18))
         del_b.setObjectName("delBtn")
         del_b.setFixedSize(40, 40)
         del_b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        del_b.setToolTip("Видалити")
         del_b.setStyleSheet(f"QPushButton {{ background: transparent; border: 1px solid #333; border-radius: 5px; }} QPushButton:hover {{ background: rgba(255, 51, 102, 0.2); border: 1px solid {BTN_DANGER}; }}")
         del_b.clicked.connect(lambda checked, v=val: delete_callback(v))
         row.addWidget(del_b)
@@ -1434,12 +1453,12 @@ class MacroPadPro(QMainWindow):
         prof_sel_lay.addWidget(self.combo_target_prof, stretch=1)
         s.addLayout(prof_sel_lay)
 
-        self.btn_prof_goto = DraggableActionButton("🔀 Перейти на вибраний профіль", "SYS:PROFILE_GOTO:0", self)
+        self.btn_prof_goto = DraggableActionButton("Перейти на вибраний профіль", "SYS:PROFILE_GOTO:0", self)
         self.btn_prof_goto.clicked.connect(lambda checked, b=self.btn_prof_goto: self.stage_action(self.get_fname(b.val), b.val, b))
         s.addWidget(self.btn_prof_goto)
         self.all_action_btns.append(self.btn_prof_goto)
 
-        self.btn_prof_hold = DraggableActionButton("🖐 Утримувати профіль (Shift / Fn-шар)", "SYS:PROFILE_HOLD:0", self)
+        self.btn_prof_hold = DraggableActionButton("Утримувати профіль (Shift / Fn-шар)", "SYS:PROFILE_HOLD:0", self)
         self.btn_prof_hold.clicked.connect(lambda checked, b=self.btn_prof_hold: self.stage_action(self.get_fname(b.val), b.val, b))
         s.addWidget(self.btn_prof_hold)
         self.all_action_btns.append(self.btn_prof_hold)
@@ -1448,13 +1467,13 @@ class MacroPadPro(QMainWindow):
         self.refresh_profile_combos()
 
         self.add_title(s, "Розумні дії для Енкодерів (Smart Dial)")
-        self.add_action(s, "🔄 Зміна режиму крутилки (по кліку SW)", "ENC:MODE_TOGGLE")
-        self.add_action(s, "☀️ Яскравість монітора", "ENC:BRIGHTNESS")
-        self.add_action(s, "📜 Прокрутка сторінки (Scroll)", "ENC:SCROLL")
-        self.add_action(s, "🔍 Масштаб (Ctrl+ / Ctrl-)", "ENC:ZOOM")
-        self.add_action(s, "🎬 Перемотка таймлайну (⬅ / ➡)", "ENC:TIMELINE")
-        self.add_action(s, "🖌 Розмір пензля ([ / ])", "ENC:BRUSH")
-        self.add_action(s, "↩️ Історія дій (Undo / Redo)", "ENC:UNDO_REDO")
+        self.add_action(s, "Зміна режиму крутилки (по кліку SW)", "ENC:MODE_TOGGLE")
+        self.add_action(s, "Яскравість монітора", "ENC:BRIGHTNESS")
+        self.add_action(s, "Прокрутка сторінки (Scroll)", "ENC:SCROLL")
+        self.add_action(s, "Масштаб (Ctrl+ / Ctrl-)", "ENC:ZOOM")
+        self.add_action(s, "Перемотка таймлайну (⬅ / ➡)", "ENC:TIMELINE")
+        self.add_action(s, "Розмір пензля ([ / ])", "ENC:BRUSH")
+        self.add_action(s, "Історія дій (Undo / Redo)", "ENC:UNDO_REDO")
 
         self.add_title(s, "Системні функції (Windows)")
         self.add_action(s, "Диспетчер завдань", "SYS:TASK")
@@ -1495,14 +1514,14 @@ class MacroPadPro(QMainWindow):
         self.combo_yt.setCurrentText("10с")
         yt_lay.addWidget(self.combo_yt)
 
-        btn_back = DraggableActionButton("Перемотати назад", f"EXT:YT_BACK:{self.combo_yt.currentText().replace('с', '')}", self)
+        btn_back = DraggableActionButton("Назад", f"EXT:YT_BACK:{self.combo_yt.currentText().replace('с', '')}", self)
         btn_back.setFixedHeight(40)
         btn_back.clicked.connect(lambda checked, btn=btn_back: self.stage_action(f"Ютуб: Назад ({self.combo_yt.currentText()})", f"EXT:YT_BACK:{self.combo_yt.currentText().replace('с', '')}", btn))
         self.combo_yt.currentTextChanged.connect(lambda txt, b=btn_back: setattr(b, 'val', f"EXT:YT_BACK:{txt.replace('с', '')}"))
         yt_lay.addWidget(btn_back)
         self.all_action_btns.append(btn_back)
 
-        btn_fwd = DraggableActionButton("Перемотати вперед", f"EXT:YT_FWD:{self.combo_yt.currentText().replace('с', '')}", self)
+        btn_fwd = DraggableActionButton("Вперед", f"EXT:YT_FWD:{self.combo_yt.currentText().replace('с', '')}", self)
         btn_fwd.setFixedHeight(40)
         btn_fwd.clicked.connect(lambda checked, btn=btn_fwd: self.stage_action(f"Ютуб: Вперед ({self.combo_yt.currentText()})", f"EXT:YT_FWD:{self.combo_yt.currentText().replace('с', '')}", btn))
         self.combo_yt.currentTextChanged.connect(lambda txt, b=btn_fwd: setattr(b, 'val', f"EXT:YT_FWD:{txt.replace('с', '')}"))
@@ -1522,10 +1541,13 @@ class MacroPadPro(QMainWindow):
         mix_h = QHBoxLayout()
         self.combo_apps = AnimatedComboBox()
         self.combo_apps.setFixedHeight(45)
-        self.combo_apps.addItem("⏳ Сканування...")
+        self.combo_apps.addItem("Сканування…")
         mix_h.addWidget(self.combo_apps, stretch=1)
 
-        btn_scan = QPushButton("🔄")
+        btn_scan = QPushButton("")
+        btn_scan.setIcon(icons.icon("refresh", ICON_COLOR))
+        btn_scan.setIconSize(QSize(18, 18))
+        btn_scan.setToolTip("Пересканувати програми зі звуком")
         btn_scan.setFixedSize(45, 45)
         btn_scan.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_scan.clicked.connect(self.scan_audio_apps)
@@ -1536,14 +1558,14 @@ class MacroPadPro(QMainWindow):
         lbl2.setStyleSheet(f"color: {TEXT_SUB}; margin-top: 10px;")
         m.addWidget(lbl2)
 
-        btn_vol = DraggableActionButton("🔊 Зміна гучності", "", self)
+        btn_vol = DraggableActionButton("Зміна гучності", "", self, icon_name="mixer")
         btn_vol.setFixedHeight(45)
         btn_vol.clicked.connect(lambda checked, btn=btn_vol: self.stage_action(f"Гучність: {self.combo_apps.currentText()}", f"ENC:APP:{self.combo_apps.currentData()}", btn))
         self.combo_apps.currentIndexChanged.connect(lambda idx, b=btn_vol: setattr(b, 'val', f"ENC:APP:{self.combo_apps.currentData()}"))
         m.addWidget(btn_vol)
         self.all_action_btns.append(btn_vol)
 
-        btn_mute = DraggableActionButton("🔇 Вимкнути звук", "", self)
+        btn_mute = DraggableActionButton("Вимкнути звук", "", self, icon_name="volume-x")
         btn_mute.setFixedHeight(45)
         btn_mute.clicked.connect(lambda checked, btn=btn_mute: self.stage_action(f"Мут: {self.combo_apps.currentText()}", f"APP_MUTE:{self.combo_apps.currentData()}", btn))
         self.combo_apps.currentIndexChanged.connect(lambda idx, b=btn_mute: setattr(b, 'val', f"APP_MUTE:{self.combo_apps.currentData()}"))
@@ -1553,7 +1575,9 @@ class MacroPadPro(QMainWindow):
 
         k = self.create_scroll_tab()
 
-        self.btn_vkb = QPushButton("⌨️ ВІРТУАЛЬНА КЛАВІАТУРА")
+        self.btn_vkb = QPushButton("ВІРТУАЛЬНА КЛАВІАТУРА")
+        self.btn_vkb.setIcon(icons.icon("keyboard", ICON_COLOR))
+        self.btn_vkb.setIconSize(QSize(20, 20))
         self.btn_vkb.setFixedHeight(50)
         self.btn_vkb.setStyleSheet(f"background-color: {BG_HOVER}; border: 1px solid {ACCENT};")
         self.btn_vkb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -1583,7 +1607,9 @@ class MacroPadPro(QMainWindow):
 
         l = self.create_scroll_tab()
         self.add_title(l, "Додати нове")
-        btn_exe = QPushButton("📂 Огляд .exe файлу...")
+        btn_exe = QPushButton("Огляд .exe файлу...")
+        btn_exe.setIcon(icons.icon("folder", ICON_COLOR))
+        btn_exe.setIconSize(QSize(18, 18))
         btn_exe.clicked.connect(self.pick_exe)
         l.addWidget(btn_exe)
 
@@ -1666,7 +1692,7 @@ class MacroPadPro(QMainWindow):
             self.vkb_anim.setStartValue(self.vkb_container.maximumHeight())
             self.vkb_anim.setEndValue(0)
             self.vkb_anim.start()
-            self.btn_vkb.setText("⌨️ ВІРТУАЛЬНА КЛАВІАТУРА")
+            self.btn_vkb.setText("ВІРТУАЛЬНА КЛАВІАТУРА")
             self.btn_vkb.setStyleSheet(f"background-color: {BG_HOVER}; border: 1px solid {ACCENT};")
             self.clear_vkb_combo()
 
@@ -1708,7 +1734,7 @@ class MacroPadPro(QMainWindow):
         if getattr(self, 'scanner', None) is not None and self.scanner.isRunning():
             return
         self.combo_apps.clear()
-        self.combo_apps.addItem("⏳ Сканування...")
+        self.combo_apps.addItem("Сканування…")
         self.combo_apps.setDisabled(True)
         self.scanner = AudioScannerThread()
         self.scanner.apps_found.connect(self.update_combo)
@@ -1736,14 +1762,14 @@ class MacroPadPro(QMainWindow):
         texts = self.config.get("RECENTS", {}).get("TEXT", [])
         for txt in reversed(texts):
             short_txt = txt if len(txt) <= 22 else txt[:22] + "..."
-            self.add_deletable_item(self.texts_layout, f"📝 {short_txt}", f"TEXT:{txt}", self.delete_recent)
+            self.add_deletable_item(self.texts_layout, short_txt, f"TEXT:{txt}", self.delete_recent)
 
     def update_recents(self):
         self.clear_layout(self.recents_layout)
         if self.config["RECENTS"]["EXE"] or self.config["RECENTS"]["URL"]:
             self.add_title(self.recents_layout, "Збережені програми та посилання")
             for ru in reversed(self.config["RECENTS"]["URL"]):
-                self.add_deletable_item(self.recents_layout, f"🌐 {ru}", f"URL:{ru}", self.delete_recent)
+                self.add_deletable_item(self.recents_layout, ru, f"URL:{ru}", self.delete_recent)
             for re in reversed(self.config["RECENTS"]["EXE"]):
                 clean_exe = os.path.basename(re).replace(".exe", "")
                 icon = QIcon()
@@ -1844,7 +1870,7 @@ class MacroPadPro(QMainWindow):
         self.clear_layout(self.multi_layout)
         for g_name in self.config.get("MULTI_LAUNCH", {}).keys():
             row = QHBoxLayout()
-            b = DraggableActionButton(f"🚀 {g_name}", f"MULTI:{g_name}", self)
+            b = DraggableActionButton(g_name, f"MULTI:{g_name}", self)
             b.clicked.connect(lambda checked, t=f"Група: {g_name}", v=f"MULTI:{g_name}", btn=b: self.stage_action(t, v, btn))
             row.addWidget(b, stretch=1)
             self.all_action_btns.append(b)
@@ -1852,7 +1878,8 @@ class MacroPadPro(QMainWindow):
             is_active = (hasattr(self, 'multi_editor') and getattr(self.multi_editor, 'current_group', None) == g_name)
 
             edit_b = QPushButton("")
-            edit_b.setIcon(QIcon(os.path.join(ASSETS_DIR, "setting.svg")))
+            edit_b.setIcon(icons.icon("settings", ACCENT if is_active else ICON_MUTED))
+            edit_b.setToolTip("Редагувати групу")
             edit_b.setIconSize(QSize(20, 20))
             edit_b.setProperty("active", "true" if is_active else "false")
             edit_b.setStyleSheet(f"""
@@ -1866,8 +1893,9 @@ class MacroPadPro(QMainWindow):
             row.addWidget(edit_b)
 
             del_b = QPushButton("")
-            del_b.setIcon(QIcon(os.path.join(ASSETS_DIR, "trash.svg")))
-            del_b.setIconSize(QSize(20, 20))
+            del_b.setIcon(icons.icon("trash", ICON_MUTED))
+            del_b.setIconSize(QSize(18, 18))
+            del_b.setToolTip("Видалити")
             del_b.setObjectName("delBtn")
             del_b.setFixedSize(40, 40)
             del_b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -1939,21 +1967,10 @@ class MacroPadPro(QMainWindow):
             except Exception:
                 pass
 
-            icon_str = ""
-            icon_path = None
-            if m_type == "Toggle":
-                icon_str = "🔄 "
-            elif m_type == "Repeat while held":
-                icon_str = "🔁 "
-            else:
-                icon_path = os.path.join(ASSETS_DIR, "setting.svg")
-
+            mode_icon = {"Toggle": "toggle", "Repeat while held": "repeat"}.get(m_type, "macro")
             row = QHBoxLayout()
 
-            b = DraggableActionButton(f"{icon_str}{m_name} [{m_type}]", f"MACRO:{m_name}", self)
-            if icon_path:
-                b.setIcon(QIcon(icon_path))
-                b.setIconSize(QSize(18, 18))
+            b = DraggableActionButton(f"{m_name} [{m_type}]", f"MACRO:{m_name}", self, icon_name=mode_icon)
             b.clicked.connect(lambda checked, t=f"Макрос: {m_name}", v=f"MACRO:{m_name}", btn=b: self.stage_action(t, v, btn))
             row.addWidget(b, stretch=1)
             self.all_action_btns.append(b)
@@ -1989,8 +2006,9 @@ class MacroPadPro(QMainWindow):
                 row.addWidget(inp_delay)
 
             del_b = QPushButton("")
-            del_b.setIcon(QIcon(os.path.join(ASSETS_DIR, "trash.svg")))
-            del_b.setIconSize(QSize(20, 20))
+            del_b.setIcon(icons.icon("trash", ICON_MUTED))
+            del_b.setIconSize(QSize(18, 18))
+            del_b.setToolTip("Видалити")
             del_b.setObjectName("delBtn")
             del_b.setFixedSize(40, 40)
             del_b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -2064,12 +2082,16 @@ class MacroPadPro(QMainWindow):
             b.setProperty("staged", "false")
             b.style().unpolish(b)
             b.style().polish(b)
+            if hasattr(b, "set_icon_staged"):
+                b.set_icon_staged(False)
 
         if btn_obj:
             try:
                 btn_obj.setProperty("staged", "true")
                 btn_obj.style().unpolish(btn_obj)
                 btn_obj.style().polish(btn_obj)
+                if hasattr(btn_obj, "set_icon_staged"):
+                    btn_obj.set_icon_staged(True)
             except RuntimeError:
                 pass
 
@@ -2157,11 +2179,14 @@ class MacroPadPro(QMainWindow):
         self.set_action(self.selected_btn, self.staged_val)
         self.update_assign_ui()
         # Раніше update_assign_ui() викликався ПІСЛЯ і одразу перезаписував "ЗБЕРЕЖЕНО"
-        self.btn_assign.setText("✅ ЗБЕРЕЖЕНО")
+        self.btn_assign.setText("ЗБЕРЕЖЕНО")
+        self.btn_assign.setIcon(icons.icon("check", "#0a0a0a"))
+        self.btn_assign.setIconSize(QSize(20, 20))
         self.btn_assign.setStyleSheet("background-color: #00ff66; color: black;")
         self.btn_assign.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
         def _restore():
+            self.btn_assign.setIcon(QIcon())
             self.btn_assign.setStyleSheet("")
             self.update_assign_ui()
         QTimer.singleShot(1500, _restore)
@@ -2239,7 +2264,7 @@ class MacroPadPro(QMainWindow):
                 # 0x0218 = WM_POWERBROADCAST (0x0012 = PBT_APMRESUMEAUTOMATIC, 0x0007 = PBT_APMRESUMESUSPEND)
                 if msg.message == 0x0218 and msg.wParam in (0x0012, 0x0007, 0x0006):
                     if hasattr(self, 'serial_thread'):
-                        self.lbl_status.setText("<font color='#888888'>⬤</font> Відновлення...")
+                        self.lbl_status.setText("<font color='#888888'>●</font> Відновлення...")
                         self.serial_thread.force_reconnect()
         except Exception:
             pass

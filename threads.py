@@ -316,13 +316,13 @@ class SerialThread(QThread):
                     self.clear_queue()
                     self._connected = True
                     self.link_signal.emit(True, proto, fw, rst)
-                    self.status_signal.emit("<font color='#00ff66'>⬤</font> Підключено", "#00ff66")
+                    self.status_signal.emit("<font color='#00ff66'>●</font> Підключено", "#00ff66")
                     for line in early:
                         self.macro_signal.emit(line, proto)
                     break
 
                 if not conn:
-                    self.status_signal.emit("<font color='#ff3366'>⬤</font> Відключено", "#ff3366")
+                    self.status_signal.emit("<font color='#ff3366'>●</font> Відключено", "#ff3366")
                     for _ in range(15):
                         if not self.is_running or self._force_reconnect:
                             break

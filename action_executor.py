@@ -200,7 +200,7 @@ class ActionExecutor(QObject):
         self.app.update_instant_vol("brightness", val)
         # OSD ще на екрані і показує "передбачене" значення — уточнюємо реальним
         if time.monotonic() < self._br_osd_until and abs(prev - val) > 0.005:
-            self.app.trigger_osd("volume", "Яскравість монітора", val, icon_text="☀️")
+            self.app.trigger_osd("volume", "Яскравість монітора", val, icon_text="brightness")
 
     # ------------------------------------------------------------------ енкодери
     def _get_enc_accel_multiplier(self, base_enc):
@@ -232,7 +232,7 @@ class ActionExecutor(QObject):
             self.app.update_instant_vol("sys", new_vol)
             for _ in range(extra_steps):
                 self._inject(win_key_event, "volumeup" if is_r else "volumedown", "tap")
-            self.app.trigger_osd("volume", "Гучність системи", new_vol, icon_text="🔊")
+            self.app.trigger_osd("volume", "Гучність системи", new_vol, icon_text="volume")
 
         elif act == "ENC:SCROLL":
             if extra_steps > 0:
@@ -247,7 +247,7 @@ class ActionExecutor(QObject):
                 self._pending_br_delta += step
             self._br_event.set()
             self._br_osd_until = time.monotonic() + 1.5
-            self.app.trigger_osd("volume", "Яскравість монітора", new_br, icon_text="☀️")
+            self.app.trigger_osd("volume", "Яскравість монітора", new_br, icon_text="brightness")
 
         elif act == "ENC:ZOOM":
             combo = "ctrl+=" if is_r else "ctrl+-"
@@ -281,7 +281,7 @@ class ActionExecutor(QObject):
             self._vol_event.set()
 
             clean_app = target.replace(".exe", "").capitalize()
-            self.app.trigger_osd("volume", f"Гучність: {clean_app}", new_vol, icon_text="🎚", app_exe=target)
+            self.app.trigger_osd("volume", f"Гучність: {clean_app}", new_vol, icon_text="mixer", app_exe=target)
 
     def _handle_rotation(self, base_enc, is_r, hw, board_accel=None):
         rot_key = f"{base_enc}_R" if is_r else f"{base_enc}_L"
@@ -497,7 +497,7 @@ class ActionExecutor(QObject):
         new_mute = not self.app.mute_states.get("sys", False)
         self.app.mute_states["sys"] = new_mute
         self.app.trigger_osd("status", "Звук вимкнено" if new_mute else "Звук увімкнено",
-                             is_danger=new_mute, icon_text="🔇" if new_mute else "🔊")
+                             is_danger=new_mute, icon_text="volume-x" if new_mute else "volume")
 
     def _toggle_mic_mute(self):
         """Виконується у воркері вводу (COM вже ініціалізовано)."""
@@ -513,7 +513,7 @@ class ActionExecutor(QObject):
             is_muted = (new_state == 1)
             self.app.mute_states["mic"] = is_muted
             self.app.trigger_osd("status", "Мікрофон вимкнено" if is_muted else "Мікрофон увімкнено",
-                                 is_danger=is_muted, icon_text="🔇" if is_muted else "🎙")
+                                 is_danger=is_muted, icon_text="mic-off" if is_muted else "mic")
         finally:
             e = d = i = vc = None
 
@@ -533,7 +533,7 @@ class ActionExecutor(QObject):
                         "status",
                         f"{clean_app}: Звук вимкнено" if is_muted else f"{clean_app}: Звук увімкнено",
                         is_danger=is_muted,
-                        icon_text="🔇" if is_muted else "🔊",
+                        icon_text="volume-x" if is_muted else "volume",
                         app_exe=target
                     )
                     v = None
