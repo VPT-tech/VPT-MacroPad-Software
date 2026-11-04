@@ -196,18 +196,49 @@ def send_unicode_text(text):
             ctypes.windll.user32.SendInput(1, ctypes.pointer(x_up), ctypes.sizeof(x_up))
         time.sleep(0.002)
 
+_WINAPI = None
+
+def _winapi():
+    """Приватні екземпляри kernel32/user32 з явними сигнатурами.
+    Без argtypes/restype HANDLE/HWND повертаються як 32-бітний int (обрізання на x64).
+    Окремі WinDLL-об'єкти, щоб не змінювати сигнатури в спільному ctypes.windll,
+    яким користуються сторонні бібліотеки (pyautogui, pygetwindow)."""
+    global _WINAPI
+    if _WINAPI is not None:
+        return _WINAPI
+    import ctypes.wintypes as wt
+    k32 = ctypes.WinDLL("kernel32")
+    u32 = ctypes.WinDLL("user32")
+    k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    k32.OpenProcess.restype = wt.HANDLE
+    k32.CloseHandle.argtypes = [wt.HANDLE]
+    k32.CloseHandle.restype = wt.BOOL
+    k32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+    k32.QueryFullProcessImageNameW.restype = wt.BOOL
+    u32.GetForegroundWindow.argtypes = []
+    u32.GetForegroundWindow.restype = wt.HWND
+    u32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+    u32.GetWindowThreadProcessId.restype = wt.DWORD
+    _WINAPI = (k32, u32)
+    return _WINAPI
+
 def get_process_path_by_pid(pid):
-    """Миттєво отримує повний шлях до .exe за PID через WinAPI"""
+    """Миттєво отримує повний шлях до .exe за PID через WinAPI.
+    PROCESS_QUERY_LIMITED_INFORMATION працює і для процесів, запущених від адміністратора."""
     if not pid:
         return ""
-    kernel32 = ctypes.windll.kernel32
+    try:
+        import ctypes.wintypes as wt
+        kernel32, _ = _winapi()
+    except Exception:
+        return ""
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
     if not h_proc:
         return ""
     try:
         buf = ctypes.create_unicode_buffer(1024)
-        size = ctypes.c_ulong(1024)
+        size = wt.DWORD(1024)
         if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
             return buf.value
     except Exception:
@@ -215,6 +246,26 @@ def get_process_path_by_pid(pid):
     finally:
         kernel32.CloseHandle(h_proc)
     return ""
+
+def get_process_exe_name(pid):
+    path = get_process_path_by_pid(pid)
+    return os.path.basename(path).lower() if path else ""
+
+def get_foreground_exe():
+    """Повертає (ім'я .exe у нижньому регістрі, pid) активного вікна або ("", 0)."""
+    try:
+        import ctypes.wintypes as wt
+        _, user32 = _winapi()
+    except Exception:
+        return "", 0
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return "", 0
+    pid = wt.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return "", 0
+    return get_process_exe_name(pid.value), pid.value
 
 def get_app_path(app_name, pid=None):
     if app_name in APP_PATH_CACHE and APP_PATH_CACHE[app_name]:
@@ -290,9 +341,12 @@ def _set_ddc_brightness_winapi(lvl):
                         for i in range(count):
                             h_phys = ctypes.c_void_p(phys_arr[i].hPhysicalMonitor)
                             # 0x10 — стандартний VCP-код яскравості (Luminance) у специфікації DDC/CI MCCS
-                            res_vcp = dxva2.SetVCPFeature(h_phys, ctypes.c_ubyte(0x10), ctypes.c_ulong(lvl))
-                            res_br = dxva2.SetMonitorBrightness(h_phys, ctypes.c_ulong(lvl))
-                            if res_vcp or res_br:
+                            # SetMonitorBrightness — лише запасний варіант: дві DDC-команди
+                            # поспіль на кожен крок перевантажують шину I2C деяких моніторів.
+                            ok = dxva2.SetVCPFeature(h_phys, ctypes.c_ubyte(0x10), ctypes.c_ulong(lvl))
+                            if not ok:
+                                ok = dxva2.SetMonitorBrightness(h_phys, ctypes.c_ulong(lvl))
+                            if ok:
                                 any_success = True
                         dxva2.DestroyPhysicalMonitors(count, phys_arr)
     except Exception:

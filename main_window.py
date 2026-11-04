@@ -30,6 +30,46 @@ from action_executor import ActionExecutor
 
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
+HW_BUTTON_IDS = [f"BTN_{i}" for i in range(1, 10)] + [f"ENC_{i}_SW" for i in range(1, 4)]
+HW_SLOTS = (("tap", "TAP"), ("dtap", "DTAP"), ("hold", "HOLD"))
+
+
+def sanitize_profile(prof, fallback_name="Профіль"):
+    """Приводить профіль (з конфігу чи імпорту) до очікуваної структури.
+    Повертає None, якщо це взагалі не профіль."""
+    if not isinstance(prof, dict):
+        return None
+    name = prof.get("name")
+    out = dict(prof)
+    out["name"] = name.strip() if isinstance(name, str) and name.strip() else fallback_name
+    out["app_bind"] = prof.get("app_bind", "") if isinstance(prof.get("app_bind", ""), str) else ""
+    actions = {}
+    raw_actions = prof.get("actions", {})
+    if isinstance(raw_actions, dict):
+        for k, v in raw_actions.items():
+            if not isinstance(k, str):
+                continue
+            if isinstance(v, str):
+                actions[k] = v
+            elif isinstance(v, dict):
+                slots = {sl: (v.get(sl) if isinstance(v.get(sl), str) else "NONE") for sl in ("tap", "dtap", "hold")}
+                if any(x != "NONE" for x in slots.values()):
+                    actions[k] = slots
+    out["actions"] = actions
+    enc_modes = {}
+    raw_modes = prof.get("enc_modes", {})
+    if isinstance(raw_modes, dict):
+        for k, v in raw_modes.items():
+            if isinstance(k, str) and isinstance(v, list):
+                lst = [m for m in v if isinstance(m, str) and m and m != "NONE"]
+                if lst:
+                    enc_modes[k] = lst
+    if enc_modes:
+        out["enc_modes"] = enc_modes
+    else:
+        out.pop("enc_modes", None)
+    return out
+
 class RightPanel(QFrame):
     def __init__(self, main_app):
         super().__init__()
@@ -58,6 +98,19 @@ class MacroPadPro(QMainWindow):
 
         self.active_profile_idx = 0
         self.ui_profiles = []
+        self._enc_mode_by_prof = {}
+
+        # Синхронізація з платою: що вже відправлено (тіньова копія) + відкладений flush
+        self._hw_shadow = {}
+        self._hw_save_pending = False
+        self.device_connected = False
+        self.hw_proto = 1
+        self.fw_version = ""
+        self._flashing = False
+        self._hw_sync_timer = QTimer(self)
+        self._hw_sync_timer.setSingleShot(True)
+        self._hw_sync_timer.setInterval(40)
+        self._hw_sync_timer.timeout.connect(self._flush_hw_sync)
 
         self.config = self.load_config()
         self.selected_btn = None
@@ -77,7 +130,6 @@ class MacroPadPro(QMainWindow):
         self.osd_signal.connect(self._show_osd_slot)
         self.profile_switch_signal.connect(self.switch_profile)
         self.current_trigger_type = "tap"  # "tap", "dtap", "hold"
-        self.enc_mode_indices = {"ENC_1": 0, "ENC_2": 0, "ENC_3": 0}
         self.volume_states = {"sys": 0.5, "mic": 0.5, "brightness": 0.7, "apps": {}}
         self.mute_states = {"sys": False, "mic": False, "apps": {}}
 
@@ -103,6 +155,9 @@ class MacroPadPro(QMainWindow):
 
         self.serial_thread = SerialThread()
         self.serial_thread.status_signal.connect(self.update_status)
+        self.serial_thread.link_signal.connect(self.on_link_changed)
+        # executor — QObject у GUI-потоці, тож з'єднання автоматично queued:
+        # уся обробка подій відбувається в GUI-потоці
         self.serial_thread.macro_signal.connect(self.executor.execute)
         self.serial_thread.start()
 
@@ -156,30 +211,67 @@ class MacroPadPro(QMainWindow):
     def is_enc_dir_hw_handled(self, base_enc, is_right):
         return self._get_enc_dir_hid_spec(base_enc, is_right).startswith("HID_")
 
-    def sync_hardware_bindings(self, save_eeprom=False):
-        """Відправляє конфігурацію поточного профілю в пам'ять плати RP2040."""
-        if not hasattr(self, 'serial_thread'):
-            return
-        btn_ids = [f"BTN_{i}" for i in range(1, 10)] + [f"ENC_{i}_SW" for i in range(1, 4)]
-        for bid in btn_ids:
+    def compute_hw_specs(self):
+        """Повна апаратна конфігурація поточного профілю: {ціль SET_KEY: spec}."""
+        specs = {}
+        for bid in HW_BUTTON_IDS:
             tr = self.get_button_triggers(bid)
+            # Прошивка не вміє змішувати HID і SERIAL в одній кнопці: якщо хоч один слот
+            # потребує ПК — кнопку повністю обробляє ПК.
             any_serial = any(action_to_hid_spec(v) == "SERIAL" for v in tr.values() if v != "NONE")
-            for slot_key, slot_name in [("tap", "TAP"), ("dtap", "DTAP"), ("hold", "HOLD")]:
+            for slot_key, slot_name in HW_SLOTS:
                 val = tr.get(slot_key, "NONE")
-                spec = "SERIAL" if (any_serial and val != "NONE") else action_to_hid_spec(val)
-                self.serial_thread.send_command(f"SET_KEY:{bid}:{slot_name}:{spec}")
-
+                specs[f"{bid}:{slot_name}"] = "SERIAL" if (any_serial and val != "NONE") else action_to_hid_spec(val)
         for i in range(1, 4):
             base_enc = f"ENC_{i}"
-            spec_l = self._get_enc_dir_hid_spec(base_enc, False)
-            spec_r = self._get_enc_dir_hid_spec(base_enc, True)
-            self.serial_thread.send_command(f"SET_KEY:{base_enc}_L:{spec_l}")
-            self.serial_thread.send_command(f"SET_KEY:{base_enc}_R:{spec_r}")
+            specs[f"{base_enc}_L"] = self._get_enc_dir_hid_spec(base_enc, False)
+            specs[f"{base_enc}_R"] = self._get_enc_dir_hid_spec(base_enc, True)
+        return specs
 
+    def sync_hardware_bindings(self, save_eeprom=False, immediate=False):
+        """Планує відправку конфігурації поточного профілю на плату RP2040.
+        Кілька змін поспіль зливаються в одну відправку; надсилаються лише змінені рядки."""
         if save_eeprom:
-            self.serial_thread.send_command("SAVE_EEPROM")
+            self._hw_save_pending = True
+        if immediate:
+            self._hw_sync_timer.stop()
+            self._flush_hw_sync()
+        else:
+            self._hw_sync_timer.start()
+
+    def _flush_hw_sync(self, force=False):
+        st = getattr(self, 'serial_thread', None)
+        if st is None or not self.device_connected:
+            return  # після підключення буде повна синхронізація (і SAVE_EEPROM, якщо він очікує)
+        cmds = []
+        for target, spec in self.compute_hw_specs().items():
+            if force or self._hw_shadow.get(target) != spec:
+                cmds.append(f"SET_KEY:{target}:{spec}")
+                self._hw_shadow[target] = spec
+        if self._hw_save_pending:
+            cmds.append("SAVE_EEPROM")
+            self._hw_save_pending = False
+        st.send_commands(cmds)
+
+    def on_link_changed(self, connected, proto, fw_version):
+        self.device_connected = bool(connected)
+        self.hw_proto = proto
+        self.fw_version = fw_version
+        if connected:
+            self._hw_shadow.clear()
+            self._hw_sync_timer.stop()
+            self._flush_hw_sync(force=True)
+            fw = fw_version or "≤ 1.0"
+            self.lbl_status.setToolTip(f"Прошивка: {fw}  •  протокол v{proto}")
+        else:
+            self._hw_shadow.clear()
+            self.lbl_status.setToolTip("")
+            # Плата зникла під час утримання кнопки — відпускаємо все, що тримає ПК
+            self.executor.on_device_disconnected()
 
     def run_silent_update_check(self):
+        if getattr(self, 'bg_updater', None) is not None and self.bg_updater.isRunning():
+            return
         self.bg_updater = CheckUpdateThread()
         self.bg_updater.update_found_signal.connect(self.show_update_button)
         self.bg_updater.start()
@@ -241,6 +333,7 @@ class MacroPadPro(QMainWindow):
 
     def apply_update(self, exe_path, uf2_path):
         if uf2_path:
+            self._flashing = True
             self.lbl_status.setText("Прошивка плати...")
             self.serial_thread.send_command("ENTER_BOOTLOADER")
 
@@ -258,6 +351,7 @@ class MacroPadPro(QMainWindow):
 
                 if pico_drive:
                     self.pico_flash_timer.stop()
+                    self._flashing = False
                     try:
                         dest_file = os.path.join(pico_drive, os.path.basename(uf2_path))
                         with open(uf2_path, 'rb') as f_src:
@@ -274,6 +368,7 @@ class MacroPadPro(QMainWindow):
 
                 elif self.pico_attempts >= 30:
                     self.pico_flash_timer.stop()
+                    self._flashing = False
                     self.serial_thread.clear_queue()
                     self.lbl_status.setText("Помилка: плату не знайдено")
                     if exe_path and os.path.exists(exe_path):
@@ -288,9 +383,13 @@ class MacroPadPro(QMainWindow):
     def run_exe_update(self, exe_path):
         from PySide6.QtWidgets import QApplication
         params = "/VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS"
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, None, 1)
-        self.cleanup_threads()
-        QApplication.quit()
+        res = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, None, 1)
+        if int(res) <= 32:
+            # Користувач відхилив UAC або запуск не вдався — програма НЕ закривається
+            self.btn_update.setText("⚠ Оновлення скасовано")
+            QTimer.singleShot(3000, self.reset_update_btn)
+            return
+        self.quit_app()
 
     def handle_app_changed(self, exe_name):
         if not self.config.get("auto_profile_switch", True):
@@ -319,20 +418,32 @@ class MacroPadPro(QMainWindow):
                 self.is_in_auto_profile = False
 
     def cleanup_threads(self):
-        for attr in ('win_tracker', 'mute_poller', 'serial_thread', 'ws_thread'):
+        try:
+            self.executor.shutdown()
+        except Exception:
+            pass
+        thread_attrs = ('win_tracker', 'mute_poller', 'serial_thread', 'ws_thread', 'scanner', 'bg_updater', 'updater')
+        for attr in thread_attrs:
             t = getattr(self, attr, None)
-            if t is not None:
+            if t is not None and hasattr(t, 'stop'):
                 try:
                     t.stop()
                 except Exception:
                     pass
-        for attr in ('win_tracker', 'mute_poller', 'serial_thread', 'ws_thread'):
+        # 400 мс не вистачало (readline з таймаутом 0.35 с + sleep 0.5 с у SerialThread):
+        # QThread, знищений під час роботи, аварійно завершує процес при виході.
+        deadline = time.monotonic() + 2.5
+        for attr in thread_attrs:
             t = getattr(self, attr, None)
-            if t is not None:
-                try:
-                    t.wait(400)
-                except Exception:
-                    pass
+            if t is None:
+                continue
+            try:
+                left_ms = max(50, int((deadline - time.monotonic()) * 1000))
+                if not t.wait(left_ms):
+                    t.terminate()
+                    t.wait(200)
+            except Exception:
+                pass
 
     def update_mute_states(self, sys_mic_mute, apps_mute, sys_mic_vol, apps_vol):
         self.mute_states["sys"] = sys_mic_mute.get("sys", False)
@@ -397,8 +508,23 @@ class MacroPadPro(QMainWindow):
         if "TEXT" not in config_data["RECENTS"]: config_data["RECENTS"]["TEXT"] = []
         if "MACROS" not in config_data: config_data["MACROS"] = {}
         if "MULTI_LAUNCH" not in config_data: config_data["MULTI_LAUNCH"] = {}
-        if "PROFILES" not in config_data or not config_data["PROFILES"]:
-            config_data["PROFILES"] = [copy.deepcopy(p) for p in BUILTIN_PRESETS.values()]
+        if not isinstance(config_data.get("RECENTS"), dict): config_data["RECENTS"] = {}
+        for rk in ("EXE", "URL", "TEXT"):
+            if not isinstance(config_data["RECENTS"].get(rk), list):
+                config_data["RECENTS"][rk] = []
+        if not isinstance(config_data.get("MACROS"), dict): config_data["MACROS"] = {}
+        if not isinstance(config_data.get("MULTI_LAUNCH"), dict): config_data["MULTI_LAUNCH"] = {}
+        # Пошкоджений профіль (без name/actions) раніше валив програму на старті (KeyError)
+        raw_profiles = config_data.get("PROFILES")
+        profiles = []
+        if isinstance(raw_profiles, list):
+            for i, p in enumerate(raw_profiles):
+                sp = sanitize_profile(p, f"Профіль {i + 1}")
+                if sp is not None:
+                    profiles.append(sp)
+        if not profiles:
+            profiles = [copy.deepcopy(p) for p in BUILTIN_PRESETS.values()]
+        config_data["PROFILES"] = profiles
         if "show_osd" not in config_data: config_data["show_osd"] = True
 
         return config_data
@@ -442,7 +568,7 @@ class MacroPadPro(QMainWindow):
             return "NONE"
         return raw if raw else "NONE"
 
-    def set_action(self, bid, val, trigger=None):
+    def set_action(self, bid, val, trigger=None, commit=True):
         profiles = self.config.get("PROFILES", [])
         if not profiles or self.active_profile_idx >= len(profiles):
             return
@@ -474,11 +600,21 @@ class MacroPadPro(QMainWindow):
                     else:
                         prof["enc_modes"][bid] = [val]
 
-        self.save_config()
-        self.sync_hardware_bindings(save_eeprom=True)
-        self.refresh_pad_dots()
-        if self.selected_btn == bid:
-            self.update_assign_ui()
+        if commit:
+            self.save_config()
+            self.sync_hardware_bindings(save_eeprom=True)
+            self.refresh_pad_dots()
+            if self.selected_btn == bid:
+                self.update_assign_ui()
+
+    @property
+    def enc_mode_indices(self):
+        """Поточні режими Smart Dial — окремо для кожного профілю
+        (раніше індекс з одного профілю переносився в інший)."""
+        profiles = self.config.get("PROFILES", [])
+        if not profiles or self.active_profile_idx >= len(profiles):
+            return {}
+        return self._enc_mode_by_prof.setdefault(id(profiles[self.active_profile_idx]), {})
 
     def get_enc_modes(self, base_enc):
         profiles = self.config.get("PROFILES", [])
@@ -512,8 +648,9 @@ class MacroPadPro(QMainWindow):
         if self.get_action(base_enc) == "NONE":
             prof.setdefault("actions", {})[base_enc] = modes[0]
         if self.get_action(f"{base_enc}_SW", "tap") == "NONE":
-            self.set_action(f"{base_enc}_SW", "ENC:MODE_TOGGLE", "tap")
+            self.set_action(f"{base_enc}_SW", "ENC:MODE_TOGGLE", "tap", commit=False)
         self.save_config()
+        self.sync_hardware_bindings(save_eeprom=True)
         self.refresh_pad_dots()
 
     def clear_enc_smart_modes(self, base_enc):
@@ -525,6 +662,8 @@ class MacroPadPro(QMainWindow):
             del prof["enc_modes"][base_enc]
         self.enc_mode_indices[base_enc] = 0
         self.save_config()
+        # Активна дія центру могла змінитись — плата має про це дізнатись
+        self.sync_hardware_bindings(save_eeprom=True)
         self.refresh_pad_dots()
 
     def cycle_enc_mode(self, base_enc):
@@ -536,7 +675,7 @@ class MacroPadPro(QMainWindow):
         active_act = modes[new_idx]
         enc_num = base_enc.replace("ENC_", "")
         self.trigger_osd("profile", f"Крутилка {enc_num}: {self.get_fname(active_act)}", icon_text="🎛")
-        self.sync_hardware_bindings(save_eeprom=False)
+        self.sync_hardware_bindings(save_eeprom=False, immediate=True)
         if base_enc in self.ui_pad_btns:
             self.ui_pad_btns[base_enc].update()
 
@@ -624,7 +763,8 @@ class MacroPadPro(QMainWindow):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     prof = json.load(f)
-                if isinstance(prof, dict) and "name" in prof and "actions" in prof:
+                prof = sanitize_profile(prof) if isinstance(prof, dict) and "actions" in prof else None
+                if prof is not None:
                     self.config.setdefault("PROFILES", []).append(prof)
                     self.save_config()
                     self.refresh_profiles_ui()
@@ -645,11 +785,15 @@ class MacroPadPro(QMainWindow):
 
         actions = profiles[idx].get("actions", {})
         new_actions = {}
+        # Залишаємо дії навігації між профілями (у будь-якому слоті), щоб з профілю можна було вийти
+        is_nav = lambda a: isinstance(a, str) and a.startswith("SYS:PROFILE_")
         for k, v in actions.items():
-            if v in ["SYS:PROFILE_NEXT", "SYS:PROFILE_PREV"]:
+            if is_nav(v):
                 new_actions[k] = v
-            elif isinstance(v, dict) and v.get("tap") in ["SYS:PROFILE_NEXT", "SYS:PROFILE_PREV"]:
-                new_actions[k] = {"tap": v["tap"], "dtap": "NONE", "hold": "NONE"}
+            elif isinstance(v, dict):
+                kept = {sl: (v.get(sl) if is_nav(v.get(sl)) else "NONE") for sl in ("tap", "dtap", "hold")}
+                if any(x != "NONE" for x in kept.values()):
+                    new_actions[k] = kept
 
         profiles[idx]["actions"] = new_actions
         profiles[idx].pop("enc_modes", None)
@@ -698,10 +842,17 @@ class MacroPadPro(QMainWindow):
                         actions[k] = new_v
 
         self.config["PROFILES"] = profiles
-        if self.active_profile_idx >= len(profiles):
-            self.active_profile_idx = len(profiles) - 1
+        if self.active_profile_idx > idx:
+            self.active_profile_idx -= 1
         elif self.active_profile_idx == idx:
             self.active_profile_idx = max(0, idx - 1)
+        self.active_profile_idx = min(self.active_profile_idx, len(profiles) - 1)
+        # Збережені індекси "повернення" теж зсуваються
+        fb = getattr(self, 'fallback_profile_idx', 0)
+        self.fallback_profile_idx = fb - 1 if fb > idx else (0 if fb == idx else fb)
+        self.executor._temp_profile_holds = {
+            k: (v - 1 if v > idx else v) for k, v in self.executor._temp_profile_holds.items() if v != idx
+        }
         self.save_config()
         self.refresh_profiles_ui()
         self.switch_profile(self.active_profile_idx)
@@ -724,9 +875,12 @@ class MacroPadPro(QMainWindow):
         for i, w in enumerate(self.ui_profiles):
             w.set_active(i == idx)
         self.refresh_pad_dots()
-        self.sync_hardware_bindings(save_eeprom=False)
+        # Перемикання профілю — без затримки, щоб вікно розсинхрону з платою було мінімальним
+        self.sync_hardware_bindings(save_eeprom=False, immediate=True)
         if self.selected_btn:
             self.update_assign_ui()
+        for btn in self.ui_pad_btns.values():
+            btn.update()
         if from_hotkey:
             prof_name = profiles[idx].get("name", f"Профіль {idx + 1}")
             prefix = "Утримання шару" if is_temp_hold else "Профіль"
@@ -737,16 +891,14 @@ class MacroPadPro(QMainWindow):
         if val in FRIENDLY_NAMES: return FRIENDLY_NAMES[val]
         if val == "HOTKEY:mouse_wheel_up": return "Скрол миші ⬆"
         if val == "HOTKEY:mouse_wheel_down": return "Скрол миші ⬇"
-        if val.startswith("SYS:PROFILE_GOTO:"):
-            idx = int(val.split(":")[-1])
+        if val.startswith("SYS:PROFILE_GOTO:") or val.startswith("SYS:PROFILE_HOLD:"):
+            try:
+                idx = int(val.split(":")[-1])
+            except ValueError:
+                return val
             profs = self.config.get("PROFILES", [])
-            pname = profs[idx]["name"] if 0 <= idx < len(profs) else f"#{idx+1}"
-            return f"Перейти: {pname}"
-        if val.startswith("SYS:PROFILE_HOLD:"):
-            idx = int(val.split(":")[-1])
-            profs = self.config.get("PROFILES", [])
-            pname = profs[idx]["name"] if 0 <= idx < len(profs) else f"#{idx+1}"
-            return f"Утримувати: {pname}"
+            pname = profs[idx].get("name", f"#{idx+1}") if 0 <= idx < len(profs) else f"#{idx+1}"
+            return f"Перейти: {pname}" if val.startswith("SYS:PROFILE_GOTO:") else f"Утримувати: {pname}"
         if val.startswith("EXT:YT_FWD:"): return f"Ютуб: Вперед ({val.split(':')[-1]}с)"
         if val.startswith("EXT:YT_BACK:"): return f"Ютуб: Назад ({val.split(':')[-1]}с)"
         if val.startswith("ENC:APP:"): return f"Гучність: {val.split(':')[-1].replace('.exe', '').capitalize()}"
@@ -1524,6 +1676,10 @@ class MacroPadPro(QMainWindow):
             self.update_assign_ui()
 
     def scan_audio_apps(self):
+        # Повторний клік під час сканування перезаписував self.scanner, і працюючий QThread
+        # знищувався збирачем сміття -> аварійне завершення програми.
+        if getattr(self, 'scanner', None) is not None and self.scanner.isRunning():
+            return
         self.combo_apps.clear()
         self.combo_apps.addItem("⏳ Сканування...")
         self.combo_apps.setDisabled(True)
@@ -1859,9 +2015,12 @@ class MacroPadPro(QMainWindow):
     def clear_btn_assignment(self, bid):
         if bid.startswith("BTN_") or bid.endswith("_SW"):
             for slot in ("tap", "dtap", "hold"):
-                self.set_action(bid, "NONE", trigger=slot)
+                self.set_action(bid, "NONE", trigger=slot, commit=False)
+            self.save_config()
+            self.sync_hardware_bindings(save_eeprom=True)
         else:
             self.set_action(bid, "NONE")
+        self.refresh_pad_dots()
         if self.selected_btn == bid:
             self.update_assign_ui()
 
@@ -1969,18 +2128,23 @@ class MacroPadPro(QMainWindow):
         if not self.selected_btn or not self.staged_val:
             return
         self.set_action(self.selected_btn, self.staged_val)
+        self.update_assign_ui()
+        # Раніше update_assign_ui() викликався ПІСЛЯ і одразу перезаписував "ЗБЕРЕЖЕНО"
         self.btn_assign.setText("✅ ЗБЕРЕЖЕНО")
         self.btn_assign.setStyleSheet("background-color: #00ff66; color: black;")
         self.btn_assign.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
-        QTimer.singleShot(1500, lambda: self.btn_assign.setText("ПРИЗНАЧИТИ"))
-        QTimer.singleShot(1500, lambda: self.btn_assign.setStyleSheet(""))
-        self.update_assign_ui()
+
+        def _restore():
+            self.btn_assign.setStyleSheet("")
+            self.update_assign_ui()
+        QTimer.singleShot(1500, _restore)
 
     def update_status(self, text, color):
-        was_disconnected = "Підключено" not in self.lbl_status.text()
-        self.lbl_status.setText(text)
-        if was_disconnected and "Підключено" in text:
-            QTimer.singleShot(200, lambda: self.sync_hardware_bindings(save_eeprom=False))
+        # Під час прошивки плата штатно "зникає" — не перетираємо статус "Прошивка плати..."
+        if self._flashing:
+            return
+        if self.lbl_status.text() != text:
+            self.lbl_status.setText(text)
 
     def setup_tray(self):
         self.tray_icon = QSystemTrayIcon(self)

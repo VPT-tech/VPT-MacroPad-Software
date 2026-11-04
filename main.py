@@ -15,6 +15,10 @@ _crash_log_handle = None
 try:
     os.makedirs(APPDATA_DIR, exist_ok=True)
     crash_file_path = os.path.join(APPDATA_DIR, "FATAL_CRASH.txt")
+    # Режим 'w' обнуляв файл при кожному запуску — трасування попереднього падіння
+    # зникало ще до того, як його хтось побачить. Зберігаємо його як .prev.txt.
+    if os.path.exists(crash_file_path) and os.path.getsize(crash_file_path) > 0:
+        os.replace(crash_file_path, os.path.join(APPDATA_DIR, "FATAL_CRASH.prev.txt"))
     _crash_log_handle = open(crash_file_path, 'w', encoding='utf-8')
     faulthandler.enable(_crash_log_handle)
 except Exception:

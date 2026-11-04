@@ -1,4 +1,6 @@
 # threads.py
+import gc
+import os
 import time
 import threading
 import serial
@@ -9,7 +11,12 @@ import ctypes
 from PySide6.QtCore import QThread, Signal
 from comtypes import CoInitialize, CoUninitialize
 from pycaw.pycaw import AudioUtilities
-from utils import get_app_path
+from utils import get_app_path, get_foreground_exe
+
+# Версія протоколу, яку запитує програма (прошивка відповідає PROTO_OK:<n>:FW=<версія>).
+# v2: прошивка позначає апаратно виконані події суфіксом ":HW".
+HOST_PROTO_VERSION = 2
+
 
 class WebSocketServerThread(QThread):
     def __init__(self):
@@ -43,21 +50,28 @@ class WebSocketServerThread(QThread):
             self.clients.discard(websocket)
 
     def send_command(self, cmd):
-        if not self.loop or not self.clients or not self.loop.is_running():
+        loop = self.loop
+        if not loop or not self.clients or not loop.is_running():
             return
+
         async def send_to_all():
             for ws in list(self.clients):
                 try:
                     await ws.send(cmd)
                 except Exception:
                     pass
-        asyncio.run_coroutine_threadsafe(send_to_all(), self.loop)
+        try:
+            asyncio.run_coroutine_threadsafe(send_to_all(), loop)
+        except RuntimeError:
+            pass
 
     def stop(self):
         self.is_running = False
 
+
 class AudioScannerThread(QThread):
     apps_found = Signal(list)
+
     def run(self):
         apps_pids = {
             "discord.exe": None,
@@ -68,13 +82,19 @@ class AudioScannerThread(QThread):
         }
         try:
             CoInitialize()
-            for s in AudioUtilities.GetAllSessions():
+            sessions = AudioUtilities.GetAllSessions()
+            for s in sessions:
                 try:
                     if s.Process and s.Process.name():
                         name = s.Process.name().lower()
                         apps_pids[name] = s.Process.pid
                 except Exception:
                     pass
+            # COM-об'єкти мають бути звільнені ДО CoUninitialize, інакше Release()
+            # викличеться вже на деініціалізованому COM і процес може впасти.
+            s = None
+            sessions = None
+            gc.collect()
         except Exception:
             pass
         finally:
@@ -87,9 +107,16 @@ class AudioScannerThread(QThread):
 
         self.apps_found.emit(results)
 
+
 class SerialThread(QThread):
-    macro_signal = Signal(str)
+    # (рядок події, версія протоколу, на якій її отримано)
+    macro_signal = Signal(str, int)
     status_signal = Signal(str, str)
+    # (підключено, версія протоколу, версія прошивки)
+    link_signal = Signal(bool, int, str)
+
+    # Службові відповіді прошивки, які не є подіями кнопок
+    _CONTROL_PREFIXES = ("PONG_VPT_MACROPAD", "EEPROM_SAVED", "PROTO_OK:")
 
     def __init__(self):
         super().__init__()
@@ -97,10 +124,25 @@ class SerialThread(QThread):
         self.queue_lock = threading.Lock()
         self.is_running = True
         self._force_reconnect = False
+        self._connected = False
+        self.proto = 1
+        self.fw_version = ""
+
+    @property
+    def is_connected(self):
+        return self._connected
 
     def send_command(self, cmd):
+        self.send_commands([cmd])
+
+    def send_commands(self, cmds):
+        # Поки плата відключена, команди не накопичуються: після підключення
+        # програма все одно робить повну синхронізацію. Раніше черга росла без меж
+        # (кожне автоперемикання профілю додавало ~45 команд) і потім вивантажувалась на плату.
+        if not cmds or not self._connected:
+            return
         with self.queue_lock:
-            self.cmd_queue.append(cmd)
+            self.cmd_queue.extend(cmds)
 
     def clear_queue(self):
         with self.queue_lock:
@@ -113,6 +155,77 @@ class SerialThread(QThread):
     def stop(self):
         self.is_running = False
 
+    def _set_disconnected(self, conn):
+        if conn:
+            try: conn.close()
+            except Exception: pass
+        was = self._connected
+        self._connected = False
+        self.clear_queue()
+        if was:
+            self.link_signal.emit(False, self.proto, self.fw_version)
+
+    @staticmethod
+    def _readline(conn):
+        return conn.readline(256).decode('utf-8', errors='ignore').strip()
+
+    def _handshake(self, port_device):
+        """Відкриває порт і перевіряє, що це саме VPT MacroPad. Повертає (conn, proto, fw, early_lines)."""
+        temp_conn = serial.Serial(port_device, 115200, timeout=0.35, write_timeout=0.5)
+        try:
+            temp_conn.dtr = False
+            temp_conn.rts = False
+            time.sleep(0.05)
+            temp_conn.dtr = True
+            temp_conn.rts = True
+            time.sleep(0.08)
+
+            temp_conn.reset_input_buffer()
+            temp_conn.reset_output_buffer()
+            temp_conn.write(b"PING_VPT_MACROPAD\n")
+            temp_conn.flush()
+
+            # Читаємо кілька рядків на випадок, якщо в буфері була подія кнопки
+            found_pong = False
+            deadline = time.time() + 0.45
+            while time.time() < deadline:
+                line = self._readline(temp_conn)
+                if line == "PONG_VPT_MACROPAD_V1":
+                    found_pong = True
+                    break
+                if not line:
+                    break
+            if not found_pong:
+                temp_conn.close()
+                return None, 1, "", []
+
+            # Узгодження версії протоколу. Стара прошивка мовчки ігнорує PROTO:x → лишаємось на v1.
+            proto, fw, early = 1, "", []
+            temp_conn.write(f"PROTO:{HOST_PROTO_VERSION}\n".encode())
+            temp_conn.flush()
+            deadline = time.time() + 0.4
+            while time.time() < deadline:
+                line = self._readline(temp_conn)
+                if not line:
+                    break
+                if line.startswith("PROTO_OK:"):
+                    parts = line.split(":")
+                    try:
+                        proto = max(1, min(HOST_PROTO_VERSION, int(parts[1])))
+                    except (IndexError, ValueError):
+                        proto = 1
+                    for p in parts[2:]:
+                        if p.startswith("FW="):
+                            fw = p[3:]
+                    break
+                if not line.startswith(self._CONTROL_PREFIXES):
+                    early.append(line)
+            return temp_conn, proto, fw, early
+        except Exception:
+            try: temp_conn.close()
+            except Exception: pass
+            raise
+
     def run(self):
         conn = None
         last_rx_or_ping = 0.0
@@ -122,54 +235,41 @@ class SerialThread(QThread):
         while self.is_running:
             if self._force_reconnect and conn:
                 self._force_reconnect = False
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                self._set_disconnected(conn)
                 conn = None
                 time.sleep(0.5)
 
             if not conn or not conn.is_open:
+                if conn is not None:
+                    self._set_disconnected(conn)
+                    conn = None
                 self._force_reconnect = False
-                for port in serial.tools.list_ports.comports():
-                    is_vpt = (port.product and "VPT MacroPad" in port.product)
+                ports = list(serial.tools.list_ports.comports())
+                # Спершу порти з нашою назвою продукту, потім інші RP2040
+                ports.sort(key=lambda p: 0 if (p.product and "VPT MacroPad" in p.product) else 1)
+                for port in ports:
+                    is_vpt = bool(port.product and "VPT MacroPad" in port.product)
                     is_rp2040 = (port.vid == 0x2E8A)
-                    if is_vpt or is_rp2040:
-                        try:
-                            temp_conn = serial.Serial(port.device, 115200, timeout=0.35, write_timeout=0.5)
-                            temp_conn.dtr = False
-                            temp_conn.rts = False
-                            time.sleep(0.05)
-                            temp_conn.dtr = True
-                            temp_conn.rts = True
-                            time.sleep(0.08)
-
-                            temp_conn.reset_input_buffer()
-                            temp_conn.reset_output_buffer()
-                            temp_conn.write(b"PING_VPT_MACROPAD\n")
-                            temp_conn.flush()
-
-                            # Читаємо кілька рядків на випадок, якщо в буфері була подія кнопки
-                            found_pong = False
-                            deadline = time.time() + 0.45
-                            while time.time() < deadline:
-                                line = temp_conn.readline().decode('utf-8', errors='ignore').strip()
-                                if line == "PONG_VPT_MACROPAD_V1":
-                                    found_pong = True
-                                    break
-                                if not line:
-                                    break
-
-                            if found_pong:
-                                conn = temp_conn
-                                last_rx_or_ping = time.time()
-                                awaiting_pong = False
-                                self.status_signal.emit("<font color='#00ff66'>⬤</font> Підключено", "#00ff66")
-                                break
-                            else:
-                                temp_conn.close()
-                        except Exception:
-                            pass
+                    if not (is_vpt or is_rp2040):
+                        continue
+                    try:
+                        c, proto, fw, early = self._handshake(port.device)
+                    except Exception:
+                        continue
+                    if c is None:
+                        continue
+                    conn = c
+                    self.proto = proto
+                    self.fw_version = fw
+                    last_rx_or_ping = time.time()
+                    awaiting_pong = False
+                    self.clear_queue()
+                    self._connected = True
+                    self.link_signal.emit(True, proto, fw)
+                    self.status_signal.emit("<font color='#00ff66'>⬤</font> Підключено", "#00ff66")
+                    for line in early:
+                        self.macro_signal.emit(line, proto)
+                    break
 
                 if not conn:
                     self.status_signal.emit("<font color='#ff3366'>⬤</font> Відключено", "#ff3366")
@@ -184,14 +284,13 @@ class SerialThread(QThread):
                 pending_cmds = list(self.cmd_queue)
                 self.cmd_queue.clear()
 
-            if pending_cmds and conn and conn.is_open:
+            if pending_cmds:
                 try:
                     payload = "".join(f"{c}\n" for c in pending_cmds).encode('utf-8')
                     conn.write(payload)
                     conn.flush()
                 except Exception:
-                    try: conn.close()
-                    except Exception: pass
+                    self._set_disconnected(conn)
                     conn = None
                     continue
 
@@ -204,14 +303,12 @@ class SerialThread(QThread):
                     awaiting_pong = True
                     ping_sent_at = now
                 except Exception:
-                    try: conn.close()
-                    except Exception: pass
+                    self._set_disconnected(conn)
                     conn = None
                     continue
             elif awaiting_pong and (now - ping_sent_at) > 1.2:
                 # Плата не відповіла на PING (зомбі-порт після гібернації) — перепідключаємось
-                try: conn.close()
-                except Exception: pass
+                self._set_disconnected(conn)
                 conn = None
                 awaiting_pong = False
                 continue
@@ -223,14 +320,12 @@ class SerialThread(QThread):
                         last_rx_or_ping = time.time()
                         awaiting_pong = False
                         msg = line.decode('utf-8', errors='ignore').strip()
-                        if msg and msg not in ("EEPROM_SAVED", "PONG_VPT_MACROPAD_V1"):
-                            self.macro_signal.emit(msg)
+                        if msg and not msg.startswith(self._CONTROL_PREFIXES):
+                            self.macro_signal.emit(msg, self.proto)
                 else:
                     time.sleep(0.005)
             except Exception:
-                if conn:
-                    try: conn.close()
-                    except Exception: pass
+                self._set_disconnected(conn)
                 conn = None
                 awaiting_pong = False
                 time.sleep(0.5)
@@ -238,9 +333,15 @@ class SerialThread(QThread):
         if conn:
             try: conn.close()
             except Exception: pass
+        self._connected = False
+
 
 class MutePollerThread(QThread):
     states_updated = Signal(dict, dict, dict, dict)
+
+    # Як часто перевідкривати аудіо-ендпоінти (зміна пристрою за замовчуванням,
+    # підключення навушників тощо). Раніше вони перевідкривались лише після помилки.
+    ENDPOINT_REFRESH_SEC = 3.0
 
     def __init__(self):
         super().__init__()
@@ -249,6 +350,15 @@ class MutePollerThread(QThread):
     def stop(self):
         self.is_running = False
 
+    @staticmethod
+    def _open_endpoint(enumerator, flow, role, iface, clsctx):
+        try:
+            d = enumerator.GetDefaultAudioEndpoint(flow, role)
+            i = d.Activate(iface._iid_, clsctx, None)
+            return ctypes.cast(i, ctypes.POINTER(iface))
+        except Exception:
+            return None
+
     def run(self):
         from comtypes import CLSCTX_ALL
         from pycaw.pycaw import EDataFlow, ERole, IAudioEndpointVolume
@@ -256,6 +366,9 @@ class MutePollerThread(QThread):
         CoInitialize()
         vc = None
         vc_mic = None
+        last_refresh = 0.0
+        last_emitted = None
+        last_emit_time = 0.0
         try:
             while self.is_running:
                 sys_mute = {"sys": False, "mic": False}
@@ -263,48 +376,57 @@ class MutePollerThread(QThread):
                 apps_mute = {}
                 apps_vol = {}
                 try:
-                    if vc is None or vc_mic is None:
+                    now = time.time()
+                    if vc is None or vc_mic is None or (now - last_refresh) > self.ENDPOINT_REFRESH_SEC:
+                        vc = vc_mic = None
                         e = AudioUtilities.GetDeviceEnumerator()
-                        try:
-                            d = e.GetDefaultAudioEndpoint(EDataFlow.eRender.value, ERole.eMultimedia.value)
-                            i = d.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                            vc = ctypes.cast(i, ctypes.POINTER(IAudioEndpointVolume))
-                        except Exception:
-                            vc = None
-
-                        try:
-                            d_mic = e.GetDefaultAudioEndpoint(EDataFlow.eCapture.value, ERole.eMultimedia.value)
-                            i_mic = d_mic.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                            vc_mic = ctypes.cast(i_mic, ctypes.POINTER(IAudioEndpointVolume))
-                        except Exception:
-                            vc_mic = None
+                        vc = self._open_endpoint(e, EDataFlow.eRender.value, ERole.eMultimedia.value, IAudioEndpointVolume, CLSCTX_ALL)
+                        vc_mic = self._open_endpoint(e, EDataFlow.eCapture.value, ERole.eMultimedia.value, IAudioEndpointVolume, CLSCTX_ALL)
+                        e = None
+                        last_refresh = now
 
                     if vc is not None:
                         sys_mute["sys"] = (vc.GetMute() != 0)
-                        sys_vol["sys"] = vc.GetMasterVolumeLevelScalar()
+                        sys_vol["sys"] = round(vc.GetMasterVolumeLevelScalar(), 3)
                     if vc_mic is not None:
                         sys_mute["mic"] = (vc_mic.GetMute() != 0)
-                        sys_vol["mic"] = vc_mic.GetMasterVolumeLevelScalar()
+                        sys_vol["mic"] = round(vc_mic.GetMasterVolumeLevelScalar(), 3)
 
                     sessions = AudioUtilities.GetAllSessions()
                     for s in sessions:
-                        if s and s.Process and s.Process.name():
-                            name = s.Process.name().lower()
-                            apps_mute[name] = (s.SimpleAudioVolume.GetMute() != 0)
-                            apps_vol[name] = s.SimpleAudioVolume.GetMasterVolume()
+                        try:
+                            if s and s.Process and s.Process.name():
+                                name = s.Process.name().lower()
+                                apps_mute[name] = (s.SimpleAudioVolume.GetMute() != 0)
+                                apps_vol[name] = round(s.SimpleAudioVolume.GetMasterVolume(), 3)
+                        except Exception:
+                            pass
+                    s = None
+                    sessions = None
 
                 except Exception:
                     vc = None
                     vc_mic = None
 
-                self.states_updated.emit(sys_mute, apps_mute, sys_vol, apps_vol)
+                snapshot = (sys_mute, apps_mute, sys_vol, apps_vol)
+                # Оновлюємо UI, коли щось змінилось (і не рідше ніж раз на 2 с —
+                # щоб скоригувати локально "передбачену" гучність після обертання енкодера)
+                now = time.time()
+                if snapshot != last_emitted or (now - last_emit_time) > 2.0:
+                    last_emitted = snapshot
+                    last_emit_time = now
+                    self.states_updated.emit(sys_mute, apps_mute, sys_vol, apps_vol)
 
                 for _ in range(10):
                     if not self.is_running: break
                     time.sleep(0.1)
         finally:
+            vc = None
+            vc_mic = None
+            gc.collect()
             try: CoUninitialize()
             except Exception: pass
+
 
 class ActiveWindowThread(QThread):
     app_changed = Signal(str)
@@ -317,25 +439,19 @@ class ActiveWindowThread(QThread):
         self.is_running = False
 
     def run(self):
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        psapi = ctypes.windll.psapi
+        own_pid = os.getpid()
         last_app = ""
 
         while self.is_running:
-            hwnd = user32.GetForegroundWindow()
-            if hwnd:
-                pid = ctypes.c_ulong()
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                h_proc = kernel32.OpenProcess(0x0410, False, pid)
-                if h_proc:
-                    buf = ctypes.create_unicode_buffer(260)
-                    if psapi.GetModuleBaseNameW(h_proc, None, buf, ctypes.sizeof(buf)):
-                        exe = buf.value.lower()
-                        if exe != last_app:
-                            last_app = exe
-                            self.app_changed.emit(exe)
-                    kernel32.CloseHandle(h_proc)
+            try:
+                exe, pid = get_foreground_exe()
+                # Власне вікно налаштувань ігноруємо: інакше при відкритті програми
+                # з Photoshop профіль одразу "відкочувався" на базовий.
+                if exe and pid != own_pid and exe != last_app:
+                    last_app = exe
+                    self.app_changed.emit(exe)
+            except Exception:
+                pass
             for _ in range(5):
                 if not self.is_running: break
                 time.sleep(0.1)

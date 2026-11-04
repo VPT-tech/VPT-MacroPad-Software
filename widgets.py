@@ -1696,6 +1696,8 @@ class MacroEditor(QFrame):
 
         self.cb_rec_mouse_move = QCheckBox("Записувати рух курсора (X, Y)")
         self.cb_rec_mouse_move.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._rec_mouse_move = False
+        self.cb_rec_mouse_move.toggled.connect(lambda v: setattr(self, "_rec_mouse_move", bool(v)))
         self.cb_rec_mouse_move.setStyleSheet(f"QCheckBox {{ color: {TEXT_SUB}; font-size: 12px; margin-left: 10px; }} QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid #444; border-radius: 4px; background: #141414; }} QCheckBox::indicator:checked {{ background: {ACCENT}; border: 1px solid {ACCENT}; }}")
 
         self.lbl_record_status = QLabel("")
@@ -1798,6 +1800,8 @@ class MacroEditor(QFrame):
 
         self.recorded_events = []
         self.pressed_keys_record = set()
+        # Хук миші працює в чужому потоці — не чіпаємо з нього Qt-віджет, кешуємо прапорець
+        self._rec_mouse_move = self.cb_rec_mouse_move.isChecked()
         self.last_event_time = time.time()
         self.last_move_time = 0.0
         self.last_move_pos = (0, 0)
@@ -1889,7 +1893,7 @@ class MacroEditor(QFrame):
         now = time.time()
 
         if isinstance(event, mouse.MoveEvent):
-            if not self.cb_rec_mouse_move.isChecked():
+            if not self._rec_mouse_move:
                 return
             if (now - self.last_move_time) < 0.030:
                 return
@@ -2693,23 +2697,35 @@ class SettingsDialog(QDialog):
 
     def check_autostart(self):
         try:
-            subprocess.check_output('schtasks /Query /TN "VPT_MacroPad_AutoStart"', shell=True, stderr=subprocess.STDOUT, creationflags=0x08000000)
+            subprocess.check_output(["schtasks", "/Query", "/TN", "VPT_MacroPad_AutoStart"],
+                                    stderr=subprocess.STDOUT, creationflags=0x08000000, timeout=5)
             return True
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return False
 
-    def toggle_autostart(self):
-        exe_path = os.path.abspath(sys.argv[0])
-        if not exe_path.lower().endswith(".exe") and sys.executable:
-            exe_path = os.path.abspath(sys.executable)
+    @staticmethod
+    def _autostart_command():
+        """Команда запуску для Планувальника завдань.
+        Раніше при запуску з .py у задачу потрапляв голий python.exe без скрипта."""
+        if getattr(sys, "frozen", False):
+            return f'"{os.path.abspath(sys.executable)}" --tray'
+        argv0 = os.path.abspath(sys.argv[0])
+        if argv0.lower().endswith(".exe"):
+            return f'"{argv0}" --tray'
+        py = os.path.abspath(sys.executable)
+        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+        if os.path.exists(pyw):
+            py = pyw
+        return f'"{py}" "{argv0}" --tray'
 
+    def toggle_autostart(self):
         enable = self.cb_autostart.isChecked()
         try:
             if enable:
                 cmd = [
                     "schtasks", "/Create", "/F",
                     "/TN", "VPT_MacroPad_AutoStart",
-                    "/TR", f'"{exe_path}" --tray',
+                    "/TR", self._autostart_command(),
                     "/SC", "ONLOGON",
                     "/RL", "HIGHEST"
                 ]
@@ -2779,36 +2795,40 @@ class AppBindDialog(QDialog):
         return self.inp_exe.text().strip().lower()
 
     def get_running_apps(self):
+        import ctypes.wintypes as wt
+        from utils import get_process_exe_name
         user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        psapi = ctypes.windll.psapi
-        
+
         apps = []
         seen = set()
-        
-        # Створюємо callback для перебору всіх вікон Windows
-        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
-        
+        own_pid = os.getpid()
+        # Ігноруємо системні вікна Windows, які висять у фоні
+        ignore = {"applicationframehost.exe", "shellexperiencehost.exe", "systemsettings.exe",
+                  "textinputhost.exe", "searchhost.exe", "explorer.exe"}
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
         def foreach_window(hwnd, lParam):
-            if user32.IsWindowVisible(hwnd):
-                length = user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    pid = ctypes.c_ulong()
-                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                    h_proc = kernel32.OpenProcess(0x0410, False, pid) # Читаємо інфу процесу
-                    if h_proc:
-                        exe_buf = ctypes.create_unicode_buffer(260)
-                        if psapi.GetModuleBaseNameW(h_proc, None, exe_buf, ctypes.sizeof(exe_buf)):
-                            exe_name = exe_buf.value.lower()
-                            # Ігноруємо системні вікна Windows, які висять у фоні
-                            ignore = ["applicationframehost.exe", "shellexperiencehost.exe", "systemsettings.exe", "textinputhost.exe", "searchhost.exe", "explorer.exe"]
-                            if exe_name not in ignore and exe_name not in seen:
+            try:
+                if user32.IsWindowVisible(hwnd):
+                    length = user32.GetWindowTextLengthW(hwnd)
+                    if length > 0:
+                        pid = wt.DWORD()
+                        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                        if pid.value and pid.value != own_pid:
+                            # PROCESS_QUERY_LIMITED_INFORMATION: бачимо й програми, запущені від адміністратора
+                            exe_name = get_process_exe_name(pid.value)
+                            if exe_name and exe_name not in ignore and exe_name not in seen:
                                 seen.add(exe_name)
                                 title_buf = ctypes.create_unicode_buffer(length + 1)
                                 user32.GetWindowTextW(hwnd, title_buf, length + 1)
                                 apps.append((exe_name, title_buf.value))
-                        kernel32.CloseHandle(h_proc)
+            except Exception:
+                pass
             return True
-            
-        user32.EnumWindows(EnumWindowsProc(foreach_window), 0)
+
+        try:
+            user32.EnumWindows(EnumWindowsProc(foreach_window), 0)
+        except Exception:
+            pass
         return sorted(apps, key=lambda x: x[0])

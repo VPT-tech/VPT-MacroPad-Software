@@ -118,11 +118,13 @@ def split_hotkey_tokens(combo: str) -> list[str]:
     s = combo.lower().strip()
     if not s:
         return []
-    placeholder_num_plus = "__NUM_PLUS__"
-    placeholder_plus = "__PLUS_KEY__"
+    # Плейсхолдери мають бути в нижньому регістрі: рядок уже переведено в lower(),
+    # і порівняння нижче теж іде в нижньому регістрі (раніше "num +" і "ctrl++" не працювали).
+    placeholder_num_plus = "\x00num_plus\x00"
+    placeholder_plus = "\x00plus_key\x00"
     s = s.replace("num +", placeholder_num_plus)
     while "++" in s:
-        s = s.replace("++", "+" + placeholder_plus)
+        s = s.replace("++", "+" + placeholder_plus, 1)
     if s == "+":
         s = placeholder_plus
     tokens = []
@@ -130,9 +132,9 @@ def split_hotkey_tokens(combo: str) -> list[str]:
         p = p.strip()
         if not p:
             continue
-        if p == placeholder_num_plus.lower():
+        if p == placeholder_num_plus:
             tokens.append("num +")
-        elif p == placeholder_plus.lower():
+        elif p == placeholder_plus:
             tokens.append("+")
         else:
             tokens.append(p)
