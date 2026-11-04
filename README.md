@@ -1,1 +1,57 @@
-# VPT-MacroPad-Software
+# VPT | Pad
+
+Програма налаштування макропада **VPT MacroPad** (9 кнопок + 3 енкодери EC11 на RP2040).
+
+| Шлях | Що це |
+|---|---|
+| `main.py` | Точка входу (single-instance, трей, журнали аварій у `%APPDATA%`) |
+| `main_window.py` | Головне вікно, профілі, синхронізація прив'язок із платою |
+| `action_executor.py` | Виконання дій: Tap / Double-Tap / Hold, енкодери, макроси |
+| `threads.py` | Фонові потоки: Serial, аудіо-мікшер, активне вікно, WebSocket (YouTube) |
+| `widgets.py`, `config.py`, `utils.py`, `updater.py` | UI-віджети, пресети/мапінги, WinAPI-утиліти, оновлення |
+| `firmware/VPT_MacroPad/` | Прошивка RP2040 (Arduino-Pico core) |
+| `tests/` | Тести клієнта, хостові тести прошивки, наскрізний тест HW ↔ SW |
+
+## Як розподіляється робота між платою і ПК
+
+Для кожної кнопки/напрямку енкодера програма обчислює специфікацію і надсилає її на плату:
+`HID_KEY / HID_MOUSE / HID_MEDIA` — плата виконує дію сама (працює навіть без запущеної програми),
+`SERIAL` — плата лише повідомляє подію, а дію виконує ПК (макроси, гучність програм, профілі тощо).
+Кнопка, у якої хоч один слот потребує ПК, повністю обробляється ПК.
+
+## Протокол Serial (115200, рядки з `\n`)
+
+ПК → плата: `PING_VPT_MACROPAD`, `PROTO:<n>`, `SET_KEY:<ціль>:<spec>`, `SAVE_EEPROM`, `RESET_HW`, `ENTER_BOOTLOADER`.
+Плата → ПК: `BTN_x_PRESSED/RELEASED`, `ENC_x_SW_PRESSED/RELEASED`, `ENC_x_LEFT/RIGHT`.
+
+**Протокол v2** (прошивка ≥ 1.1.0) вмикається командою `PROTO:2` (відповідь `PROTO_OK:2:FW=<версія>`)
+і скидається, коли ПК закриває порт:
+
+* до подій, які плата вже виконала апаратно, додається `:HW` (напр. `BTN_1_PRESSED:HW`);
+* при апаратному спрацюванні слоту надсилається `BTN_x_FIRED:TAP|DTAP|HOLD` (для OSD).
+
+Тож ПК більше не «вгадує» за своєю копією конфігурації, чи виконала плата дію, і дія не дублюється
+та не губиться під час перемикання профілю. Стара прошивка ігнорує `PROTO:2`, і програма
+автоматично працює з нею за протоколом v1.
+
+## Тести
+
+```bash
+# Хостові тести прошивки (моки Arduino API, плата не потрібна)
+make -C tests/firmware_sim
+
+# Тести Python-клієнта + наскрізний тест з прошивкою, що працює окремим процесом
+pip install -r requirements.txt
+QT_QPA_PLATFORM=offscreen pytest tests
+```
+
+Наскрізний тест (`tests/test_e2e_hw_sync.py`) запускає справжнє вікно `MacroPadPro` і `SerialThread`,
+підключені до прошивки, зібраної під хост, — і для поточної прошивки, і для старої v1.0
+(`tests/firmware_sim/legacy/`), щоб гарантувати сумісність з ще не оновленими платами.
+
+## Збірка прошивки
+
+```bash
+arduino-cli core install rp2040:rp2040   # https://github.com/earlephilhower/arduino-pico
+arduino-cli compile --fqbn rp2040:rp2040:rpipico firmware/VPT_MacroPad
+```

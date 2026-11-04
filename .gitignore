@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# бінарники хостових тестів прошивки
+tests/firmware_sim/test_firmware
+tests/firmware_sim/fw_stdio
+tests/firmware_sim/fw_stdio_legacy
+# збірки
+build/
+dist/
