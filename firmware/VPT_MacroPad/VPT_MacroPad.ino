@@ -17,6 +17,9 @@
 //     до подій додається суфікс ":HW", якщо подію вже виконано апаратно (HID),
 //     а при апаратному спрацюванні слоту надсилається BTN_x_FIRED:TAP|DTAP|HOLD.
 //     Це дозволяє ПК ніколи не дублювати й не пропускати дію під час ресинхронізації.
+//     Події енкодера несуть множник прискорення ":A<1..5>", виміряний на платі за
+//     інтервалом між клацаннями (ПК не бачить реальних інтервалів — USB доставляє пачками).
+//     Якщо плата перезапустилась через watchdog, у PROTO_OK додається ":RST=WDT".
 
 #include <Arduino.h>
 #ifdef USB
@@ -52,11 +55,19 @@ const int8_t ENC_TABLE[16] = {
    0, -1,  1,  0
 };
 
-const unsigned long DEBOUNCE_DELAY = 20;
+// "Швидкий" debounce: зміну стану приймаємо, щойно сигнал стабільний DEBOUNCE_CONFIRM_MS
+// (короткі завади відсіюються), а брязкіт контактів після цього гасимо блокуванням
+// DEBOUNCE_LOCKOUT_MS. Раніше подія фіксувалась лише після 20 мс тиші (+20 мс затримки).
+const unsigned long DEBOUNCE_CONFIRM_MS = 2;
+const unsigned long DEBOUNCE_LOCKOUT_MS = 20;
 const unsigned long HOLD_TIME_MS   = 300;
 const unsigned long DTAP_WINDOW_MS = 220;
 const unsigned long TAP_RELEASE_MS = 8;
 const int MAX_ENC_STEPS_PER_LOOP   = 16;
+// Апаратний watchdog: якщо loop() не виконується 5 с (зависання), плата перезапускається.
+// Найдовша легітимна пауза — очікування HID-звіту (до 500 мс) і запис у флеш (~50 мс).
+const uint32_t WDT_TIMEOUT_MS      = 5000;
+bool bootByWatchdog = false;
 
 // Типи дій у пам'яті EEPROM
 enum ActionType : uint8_t {
@@ -104,7 +115,8 @@ static inline bool sameBinding(const HidBinding &a, const HidBinding &b) {
 // ---------------- Стан кнопок ----------------
 bool lastReadings[NUM_BTNS];
 bool btnStates[NUM_BTNS];
-unsigned long lastDebounceTimes[NUM_BTNS];
+unsigned long lastDebounceTimes[NUM_BTNS];   // коли сигнал востаннє змінився
+unsigned long lastAcceptedTimes[NUM_BTNS];   // коли востаннє прийняли зміну стану
 
 // Машина станів Multi-Tap
 unsigned long pressStartTime[NUM_BTNS];
@@ -126,6 +138,9 @@ PressContext pressCtx[NUM_BTNS];
 volatile uint8_t encIsrState[NUM_ENC];
 volatile int8_t  encIsrDelta[NUM_ENC];
 volatile int16_t encSteps[NUM_ENC];   // накопичені клацання: + праворуч, - ліворуч
+volatile uint32_t encLastDetentMs[NUM_ENC];
+volatile int8_t   encLastDir[NUM_ENC];
+volatile uint32_t encMinInterval[NUM_ENC];  // мінімальний інтервал між клацаннями з останньої обробки
 
 static inline uint8_t readEncPins(int idx) {
   return (digitalRead(encCLKPins[idx]) ? 1 : 0) | (digitalRead(encDTPins[idx]) ? 2 : 0);
@@ -138,8 +153,16 @@ static void encoderIsr(int idx) {
   int8_t d = encIsrDelta[idx] + ENC_TABLE[(prev << 2) | s];
   encIsrState[idx] = s;
   if (s == 3) { // фіксоване положення (detent)
-    if (d >= 2) encSteps[idx]++;
-    else if (d <= -2) encSteps[idx]--;
+    int8_t dir = (d >= 2) ? 1 : (d <= -2) ? -1 : 0;
+    if (dir != 0) {
+      uint32_t now = millis();
+      // Зміна напрямку — це не "швидке обертання", інтервал не рахуємо
+      uint32_t dt = (dir == encLastDir[idx]) ? (now - encLastDetentMs[idx]) : 0xFFFFFFFFu;
+      encLastDetentMs[idx] = now;
+      encLastDir[idx] = dir;
+      if (dt < encMinInterval[idx]) encMinInterval[idx] = dt;
+      encSteps[idx] += dir;
+    }
     d = 0;
   }
   encIsrDelta[idx] = d;
@@ -330,9 +353,11 @@ void sendSerialLine(const char *msg) {
   }
 }
 
-void sendEvent(const char *name, const char *suffix, bool hwHandled) {
+void sendEvent(const char *name, const char *suffix, bool hwHandled, uint8_t accel) {
   char buf[48];
-  snprintf(buf, sizeof(buf), "%s%s%s", name, suffix, (protoLevel >= 2 && hwHandled) ? ":HW" : "");
+  char accelTag[8] = "";
+  if (protoLevel >= 2 && accel > 0) snprintf(accelTag, sizeof(accelTag), ":A%u", (unsigned)accel);
+  snprintf(buf, sizeof(buf), "%s%s%s%s", name, suffix, (protoLevel >= 2 && hwHandled) ? ":HW" : "", accelTag);
   sendSerialLine(buf);
 }
 
@@ -413,9 +438,11 @@ void processSerialCommand(char *cmd) {
     int req = atoi(cmd + 6);
     if (req < 1) req = 1;
     protoLevel = (req > PROTO_MAX) ? PROTO_MAX : (uint8_t)req;
-    char buf[40];
-    snprintf(buf, sizeof(buf), "PROTO_OK:%u:FW=%s", (unsigned)protoLevel, FW_VERSION);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "PROTO_OK:%u:FW=%s%s", (unsigned)protoLevel, FW_VERSION,
+             (bootByWatchdog && protoLevel >= 2) ? ":RST=WDT" : "");
     Serial.println(buf);
+    if (protoLevel >= 2) bootByWatchdog = false;  // повідомляємо лише один раз
   } else if (strcmp(cmd, "ENTER_BOOTLOADER") == 0) {
     releaseAllHid();
     Serial.flush();
@@ -481,8 +508,11 @@ void handleButtonLogic(int idx) {
 
   PressContext &ctx = pressCtx[idx];
 
-  if ((now - lastDebounceTimes[idx]) > DEBOUNCE_DELAY && reading != btnStates[idx]) {
+  bool stable = (now - lastDebounceTimes[idx]) >= DEBOUNCE_CONFIRM_MS;
+  bool lockedOut = (now - lastAcceptedTimes[idx]) < DEBOUNCE_LOCKOUT_MS;
+  if (stable && !lockedOut && reading != btnStates[idx]) {
     btnStates[idx] = reading;
+    lastAcceptedTimes[idx] = now;
     const char *bName = getBtnName(idx);
 
     if (btnStates[idx] == LOW) {
@@ -495,7 +525,7 @@ void handleButtonLogic(int idx) {
       holdTriggered[idx] = false;
       fastPathActive[idx] = false;
 
-      sendEvent(bName, "_PRESSED", !ctx.serialMode);
+      sendEvent(bName, "_PRESSED", !ctx.serialMode, 0);
 
       if (!ctx.serialMode) {
         bool hasMulti = (ctx.slots[SLOT_DTAP].type != ACT_NONE) || (ctx.slots[SLOT_HOLD].type != ACT_NONE);
@@ -507,7 +537,7 @@ void handleButtonLogic(int idx) {
         }
       }
     } else {
-      sendEvent(bName, "_RELEASED", !ctx.serialMode);
+      sendEvent(bName, "_RELEASED", !ctx.serialMode, 0);
 
       if (!ctx.serialMode) {
         if (fastPathActive[idx]) {
@@ -562,29 +592,42 @@ void handleButtonLogic(int idx) {
 }
 
 // ---------------- Логіка енкодерів ----------------
+// Пороги прискорення (інтервал між клацаннями в одному напрямку, мс -> множник).
+// Мають збігатися з ActionExecutor._get_enc_accel_multiplier (запасний варіант для старої прошивки).
+static uint8_t encAccelFromInterval(uint32_t dt) {
+  if (dt < 25) return 5;
+  if (dt < 50) return 3;
+  if (dt < 85) return 2;
+  return 1;
+}
+
 void processEncoder(int idx) {
   static const char *const ENC_NAMES[NUM_ENC] = {"ENC_1", "ENC_2", "ENC_3"};
 
   noInterrupts();
   int16_t steps = encSteps[idx];
+  uint32_t minInterval = encMinInterval[idx];
   encSteps[idx] = 0;
+  encMinInterval[idx] = 0xFFFFFFFFu;
   interrupts();
   if (steps == 0) return;
 
   int dir = (steps > 0) ? 1 : 0;          // 1 = RIGHT (за годинниковою), 0 = LEFT
   int count = (steps > 0) ? steps : -steps;
   if (count > MAX_ENC_STEPS_PER_LOOP) count = MAX_ENC_STEPS_PER_LOOP;
+  uint8_t accel = encAccelFromInterval(minInterval);
 
   for (int n = 0; n < count; n++) {
     const HidBinding b = hwConfig.encoders[idx][dir];
     bool hw = isHidType(b.type);
     if (hw) tapHidNonBlocking(b);
-    sendEvent(ENC_NAMES[idx], dir == 1 ? "_RIGHT" : "_LEFT", hw);
+    sendEvent(ENC_NAMES[idx], dir == 1 ? "_RIGHT" : "_LEFT", hw, accel);
   }
 }
 
 // ---------------- setup / loop ----------------
 void setup() {
+  bootByWatchdog = (rp2040.getResetReason() == RP2040::WDT_RESET);
   USB.disconnect();
   USB.setManufacturer("VPT Tech");
   USB.setProduct("VPT MacroPad");
@@ -603,6 +646,7 @@ void setup() {
     lastReadings[i] = HIGH;
     btnStates[i] = HIGH;
     lastDebounceTimes[i] = 0;
+    lastAcceptedTimes[i] = 0;
     pressStartTime[i] = 0;
     lastReleaseTime[i] = 0;
     tapCount[i] = 0;
@@ -618,14 +662,20 @@ void setup() {
     encIsrState[e] = readEncPins(e);
     encIsrDelta[e] = 0;
     encSteps[e] = 0;
+    encLastDetentMs[e] = 0;
+    encLastDir[e] = 0;
+    encMinInterval[e] = 0xFFFFFFFFu;
     // Переривання замість опитування: кроки не губляться, навіть коли цикл
     // зайнятий відправкою HID-звітів або записом у флеш.
     attachInterrupt(digitalPinToInterrupt(encCLKPins[e]), ENC_ISRS[e], CHANGE);
     attachInterrupt(digitalPinToInterrupt(encDTPins[e]), ENC_ISRS[e], CHANGE);
   }
+
+  rp2040.wdt_begin(WDT_TIMEOUT_MS);
 }
 
 void loop() {
+  rp2040.wdt_reset();
   processPendingReleases();
 
   for (int i = 0; i < NUM_BTNS; i++) {

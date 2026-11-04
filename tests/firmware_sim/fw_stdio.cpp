@@ -22,7 +22,7 @@ voidFuncPtr isr[64];
 int irq_disabled = 0;
 }
 MockSerial Serial;
-MockRP2040 rp2040;
+RP2040 rp2040;
 MockUSB USB;
 MockKeyboard Keyboard;
 MockMouse Mouse;

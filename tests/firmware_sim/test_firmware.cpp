@@ -12,7 +12,7 @@ voidFuncPtr isr[64];
 int irq_disabled = 0;
 }
 MockSerial Serial;
-MockRP2040 rp2040;
+RP2040 rp2040;
 MockUSB USB;
 MockKeyboard Keyboard;
 MockMouse Mouse;
@@ -30,6 +30,7 @@ static void boot(bool keep_flash = false) {
   if (!keep_flash) EEPROM = MockEEPROM();
   for (int i = 0; i < 64; i++) { sim::pin_level[i] = HIGH; sim::isr[i] = nullptr; }
   Serial = MockSerial();
+  rp2040 = RP2040();
   Keyboard = MockKeyboard();
   Mouse = MockMouse();
   protoLevel = 1; hostWasOpen = false; rxLen = 0; rxOverflow = false;
@@ -206,8 +207,8 @@ static void test_encoder_isr_and_tags() {
   clear_io();
   enc_click(0, +1);
   enc_click(0, -1);
-  CHECK(has_line("ENC_1_RIGHT:HW"));
-  CHECK(has_line("ENC_1_LEFT"));
+  CHECK(has_line("ENC_1_RIGHT:HW:A1"));   // зміна напрямку — без прискорення
+  CHECK(has_line("ENC_1_LEFT:A1"));
   CHECK(count_log(Keyboard.log, "+c233") == 1);
 
   // Кроки не губляться, навіть якщо цикл "завис" (ISR накопичує клацання)
@@ -291,6 +292,98 @@ static void test_bootloader_releases_keys() {
   CHECK(Keyboard.down.empty());
 }
 
+static void test_watchdog() {
+  boot();
+  CHECK(rp2040.wdt_timeout == WDT_TIMEOUT_MS);
+  CHECK(WDT_TIMEOUT_MS <= 8000);           // апаратний максимум RP2040 ~8.3 с
+  int feeds = rp2040.wdt_feeds;
+  run_ms(10);
+  CHECK(rp2040.wdt_feeds >= feeds + 10);   // годуємо на кожній ітерації loop()
+  clear_io();
+  cmd("PROTO:2");
+  CHECK(has_line(std::string("PROTO_OK:2:FW=") + FW_VERSION));
+
+  // Плата перезапустилась через watchdog -> ПК дізнається про це під час рукостискання
+  EEPROM = MockEEPROM();
+  for (int i = 0; i < 64; i++) { sim::pin_level[i] = HIGH; sim::isr[i] = nullptr; }
+  Serial = MockSerial();
+  rp2040 = RP2040();
+  rp2040.reset_reason = RP2040::WDT_RESET;
+  protoLevel = 1; hostWasOpen = false; rxLen = 0; rxOverflow = false;
+  setup();
+  run_ms(5);
+  cmd("PROTO:2");
+  CHECK(has_line(std::string("PROTO_OK:2:FW=") + FW_VERSION + ":RST=WDT"));
+  clear_io();
+  cmd("PROTO:2");                          // повторне підключення — вже без повідомлення
+  CHECK(has_line(std::string("PROTO_OK:2:FW=") + FW_VERSION));
+}
+
+static void test_encoder_accel_measured_on_board() {
+  boot();
+  cmd("PROTO:2");
+  // Пауза gap_ms ПЕРЕД кожним клацанням: інтервал кожного клацання = gap_ms (+1 мс циклу)
+  auto rotate = [](int dir, int n, int gap_ms) {
+    for (int i = 0; i < n; i++) { run_ms(gap_ms); enc_click(0, dir); }
+  };
+  rotate(+1, 1, 200);
+  clear_io();
+  rotate(+1, 3, 10);     // дуже швидко
+  CHECK(count_prefix("ENC_1_RIGHT:A5") == 3);
+  clear_io();
+  rotate(+1, 2, 40);
+  CHECK(count_prefix("ENC_1_RIGHT:A3") == 2);
+  clear_io();
+  rotate(+1, 2, 60);
+  CHECK(count_prefix("ENC_1_RIGHT:A2") == 2);
+  clear_io();
+  rotate(+1, 2, 150);    // повільно
+  CHECK(count_prefix("ENC_1_RIGHT:A1") == 2);
+  clear_io();
+  rotate(-1, 1, 5);      // різка зміна напрямку — не прискорення
+  CHECK(has_line("ENC_1_LEFT:A1"));
+  // v1 (стара програма) — без жодних суфіксів
+  boot();
+  clear_io();
+  rotate(+1, 2, 10);
+  CHECK(count_prefix("ENC_1_RIGHT") == 2 && has_line("ENC_1_RIGHT"));
+}
+
+static void test_fast_debounce() {
+  boot();
+  clear_io();
+  // Затримка реакції ~2 мс замість ~21 мс
+  sim::pin_level[PIN_BTN1] = LOW;
+  run_ms(4);
+  CHECK(has_line("BTN_1_PRESSED"));
+  release(PIN_BTN1, 40);
+  CHECK(has_line("BTN_1_RELEASED"));
+
+  // Брязкіт контактів на натисканні та відпусканні -> рівно одна пара подій
+  clear_io();
+  const int bounce[] = {LOW, LOW, LOW, HIGH, HIGH, HIGH, LOW, HIGH, LOW, LOW, LOW, LOW};  // відскок 3 мс
+  for (int lv : bounce) { sim::pin_level[PIN_BTN1] = lv; run_ms(1); }
+  run_ms(50);
+  const int bounce_up[] = {HIGH, HIGH, HIGH, LOW, LOW, LOW, HIGH, LOW, HIGH, HIGH, HIGH, HIGH};
+  for (int lv : bounce_up) { sim::pin_level[PIN_BTN1] = lv; run_ms(1); }
+  run_ms(50);
+  CHECK(count_prefix("BTN_1_PRESSED") == 1);
+  CHECK(count_prefix("BTN_1_RELEASED") == 1);
+
+  // Коротка завада (1 мс) не є натисканням
+  clear_io();
+  sim::pin_level[PIN_BTN1] = LOW; run_ms(1);
+  sim::pin_level[PIN_BTN1] = HIGH; run_ms(30);
+  CHECK(count_prefix("BTN_1_") == 0);
+
+  // Дуже короткий тап (8 мс) не губиться: відпускання фіксується після блокування
+  clear_io();
+  sim::pin_level[PIN_BTN1] = LOW; run_ms(8);
+  sim::pin_level[PIN_BTN1] = HIGH; run_ms(40);
+  CHECK(count_prefix("BTN_1_PRESSED") == 1);
+  CHECK(count_prefix("BTN_1_RELEASED") == 1);
+}
+
 int main() {
   test_default_serial_events();
   test_ping_and_proto();
@@ -302,6 +395,9 @@ int main() {
   test_serial_robustness();
   test_eeprom_persistence();
   test_bootloader_releases_keys();
+  test_watchdog();
+  test_encoder_accel_measured_on_board();
+  test_fast_debounce();
   std::cout << (g_failed ? "FAILED " : "OK ") << (g_checks - g_failed) << "/" << g_checks << " checks passed" << std::endl;
   return g_failed ? 1 : 0;
 }

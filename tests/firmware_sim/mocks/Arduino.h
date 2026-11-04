@@ -79,8 +79,15 @@ public:
 };
 extern MockSerial Serial;
 
-struct MockRP2040 {
+struct RP2040 {
+  enum resetReason_t {UNKNOWN_RESET, PWRON_RESET, RUN_PIN_RESET, SOFT_RESET, WDT_RESET, DEBUG_RESET, GLITCH_RESET, BROWNOUT_RESET};
   int bootloader_calls = 0;
+  uint32_t wdt_timeout = 0;
+  int wdt_feeds = 0;
+  resetReason_t reset_reason = PWRON_RESET;
   void rebootToBootloader() { bootloader_calls++; }
+  void wdt_begin(uint32_t ms) { wdt_timeout = ms; }
+  void wdt_reset() { wdt_feeds++; }
+  resetReason_t getResetReason() { return reset_reason; }
 };
-extern MockRP2040 rp2040;
+extern RP2040 rp2040;
