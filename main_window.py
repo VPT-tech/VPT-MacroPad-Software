@@ -21,6 +21,7 @@ from comtypes import CLSCTX_ALL, CoInitialize
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
 from updater import UpdaterThread, CheckUpdateThread
+import updater as updater_mod
 
 from config import *
 from utils import win_key_event, win_hotkey, get_app_path
@@ -253,7 +254,7 @@ class MacroPadPro(QMainWindow):
             self._hw_save_pending = False
         st.send_commands(cmds)
 
-    def on_link_changed(self, connected, proto, fw_version):
+    def on_link_changed(self, connected, proto, fw_version, reset_reason=""):
         self.device_connected = bool(connected)
         self.hw_proto = proto
         self.fw_version = fw_version
@@ -262,7 +263,19 @@ class MacroPadPro(QMainWindow):
             self._hw_sync_timer.stop()
             self._flush_hw_sync(force=True)
             fw = fw_version or "≤ 1.0"
-            self.lbl_status.setToolTip(f"Прошивка: {fw}  •  протокол v{proto}")
+            tip = f"Прошивка: {fw}  •  протокол v{proto}"
+            if reset_reason == "WDT":
+                # Апаратний watchdog перезапустив плату після зависання. Прив'язки вже
+                # відновлено повною синхронізацією вище — лише повідомляємо користувача.
+                self.last_board_reset = time.strftime("%H:%M:%S")
+                tip += f"\n⚠ Плата перезапускалась після зависання (watchdog), {self.last_board_reset}"
+                msg = "Макропад перезапустився після зависання (watchdog). Налаштування відновлено."
+                try:
+                    self.tray_icon.showMessage("VPT | Pad", msg, QSystemTrayIcon.MessageIcon.Warning, 6000)
+                except Exception:
+                    pass
+                self.trigger_osd("status", "Плату перезапущено (watchdog)", is_danger=True, icon_text="⚠️")
+            self.lbl_status.setToolTip(tip)
         else:
             self._hw_shadow.clear()
             self.lbl_status.setToolTip("")
@@ -332,6 +345,9 @@ class MacroPadPro(QMainWindow):
             self.reset_update_btn()
 
     def apply_update(self, exe_path, uf2_path):
+        if uf2_path and not updater_mod.is_verified(uf2_path):
+            self.lbl_status.setText("⚠ Прошивка не пройшла перевірку SHA-256")
+            uf2_path = ""
         if uf2_path:
             self._flashing = True
             self.lbl_status.setText("Прошивка плати...")
@@ -352,17 +368,22 @@ class MacroPadPro(QMainWindow):
                 if pico_drive:
                     self.pico_flash_timer.stop()
                     self._flashing = False
+                    flashed = False
                     try:
                         dest_file = os.path.join(pico_drive, os.path.basename(uf2_path))
                         with open(uf2_path, 'rb') as f_src:
                             content = f_src.read()
-                        with open(dest_file, 'wb') as f_dst:
-                            f_dst.write(content)
-                            f_dst.flush()
+                        # Перевіряємо саме ті байти, які пишемо на плату (без вікна для підміни файлу)
+                        expected = updater_mod.expected_sha256_for_path(uf2_path)
+                        if expected and updater_mod.sha256_bytes(content) == expected:
+                            with open(dest_file, 'wb') as f_dst:
+                                f_dst.write(content)
+                                f_dst.flush()
+                            flashed = True
                     except Exception:
                         pass
 
-                    self.lbl_status.setText("Прошивку оновлено!")
+                    self.lbl_status.setText("Прошивку оновлено!" if flashed else "⚠ Прошивку не записано")
                     if exe_path and os.path.exists(exe_path):
                         QTimer.singleShot(2000, lambda: self.run_exe_update(exe_path))
 
@@ -382,6 +403,12 @@ class MacroPadPro(QMainWindow):
 
     def run_exe_update(self, exe_path):
         from PySide6.QtWidgets import QApplication
+        if not updater_mod.is_verified(exe_path):
+            # Файл змінився після завантаження (або не мав контрольної суми) — з правами
+            # адміністратора такий файл не запускаємо
+            self.btn_update.setText("⚠ Інсталятор не пройшов перевірку")
+            QTimer.singleShot(4000, self.reset_update_btn)
+            return
         params = "/VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS"
         res = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, None, 1)
         if int(res) <= 32:

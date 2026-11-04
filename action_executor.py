@@ -19,11 +19,11 @@ import subprocess
 import ctypes
 import pyautogui
 
-from PySide6.QtCore import QObject, QTimer, Slot
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from comtypes import CLSCTX_ALL, CoInitialize
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from utils import (win_key_event, win_hotkey, win_hotkey_down, win_hotkey_up,
-                   send_unicode_text, move_mouse_abs, set_monitor_brightness)
+                   send_unicode_text, move_mouse_abs, set_monitor_brightness, get_monitor_brightness)
 
 BUTTON_IDS = frozenset([f"BTN_{i}" for i in range(1, 10)] + [f"ENC_{i}_SW" for i in range(1, 4)])
 ENC_IDS = frozenset(f"ENC_{i}" for i in range(1, 4))
@@ -39,7 +39,21 @@ def _parse_event(raw):
     return base, flags
 
 
+def _accel_from_flags(flags):
+    """Множник прискорення, виміряний платою (':A3'), або None."""
+    for f in flags:
+        if len(f) >= 2 and f[0] == "A" and f[1:].isdigit():
+            return max(1, min(5, int(f[1:])))
+    return None
+
+
 class ActionExecutor(QObject):
+    # Фактична яскравість монітора (з воркера яскравості -> GUI-потік)
+    brightness_synced = Signal(float)
+    # Якщо яскравість довго не чіпали, перед наступною зміною її перечитуємо з монітора
+    # (її могли змінити кнопками самого монітора чи іншою програмою)
+    BRIGHTNESS_RESYNC_SEC = 20.0
+
     def __init__(self, main_app):
         super().__init__()
         self.app = main_app
@@ -72,10 +86,16 @@ class ActionExecutor(QObject):
         self._vol_worker_thread = threading.Thread(target=self._app_vol_worker, name="vpt-appvol", daemon=True)
         self._vol_worker_thread.start()
 
-        # Асинхронний воркер для плавного регулювання яскравості монітора
-        self._pending_brightness = None
+        # Асинхронний воркер для плавного регулювання яскравості монітора.
+        # GUI передає лише відносні зміни (дельти), а абсолютне значення веде воркер,
+        # спираючись на реально прочитану з монітора яскравість.
+        self._pending_br_delta = 0.0
+        self._br_base = None            # належить воркеру
+        self._br_last_sync = 0.0        # належить воркеру
+        self._br_osd_until = 0.0
         self._br_lock = threading.Lock()
         self._br_event = threading.Event()
+        self.brightness_synced.connect(self._on_brightness_synced)
         self._br_worker_thread = threading.Thread(target=self._brightness_worker, name="vpt-brightness", daemon=True)
         self._br_worker_thread.start()
 
@@ -131,22 +151,56 @@ class ActionExecutor(QObject):
                 except Exception:
                     pass
 
+    def _br_resync(self, allow_wmi):
+        """Читає фактичну яскравість монітора (виконується у воркері яскравості)."""
+        try:
+            val = get_monitor_brightness(allow_wmi=allow_wmi)
+        except Exception:
+            val = None
+        if val is not None:
+            self._br_base = max(0.0, min(1.0, float(val)))
+            self._br_last_sync = time.monotonic()
+        return val
+
     def _brightness_worker(self):
+        # Стартове зчитування (DDC/CI, для ноутбуків — WMI), щоб індикатор і перший крок
+        # енкодера відповідали реальності, а не припущеним 70%
+        if self._br_resync(allow_wmi=True) is not None:
+            self.brightness_synced.emit(self._br_base)
         while True:
             self._br_event.wait()
             self._br_event.clear()
             while True:
                 with self._br_lock:
-                    if self._pending_brightness is None:
-                        break
-                    val = self._pending_brightness
-                    self._pending_brightness = None
+                    delta = self._pending_br_delta
+                    self._pending_br_delta = 0.0
+                if abs(delta) < 1e-9:
+                    break
+                if self._br_base is None or (time.monotonic() - self._br_last_sync) > self.BRIGHTNESS_RESYNC_SEC:
+                    # Лише швидкий DDC: повільний WMI (~1 с) тут дав би помітну затримку
+                    self._br_resync(allow_wmi=False)
+                base = self._br_base if self._br_base is not None else 0.7
+                new_val = max(0.0, min(1.0, base + delta))
                 try:
-                    set_monitor_brightness(val)
+                    set_monitor_brightness(new_val)
                 except Exception:
                     pass
+                self._br_base = new_val
+                self._br_last_sync = time.monotonic()
+                with self._br_lock:
+                    more_pending = abs(self._pending_br_delta) > 1e-9
+                if not more_pending:
+                    self.brightness_synced.emit(new_val)
                 # Контролери моніторів по шині DDC/CI (I2C) потребують ~45 мс між пакетами
                 time.sleep(0.045)
+
+    @Slot(float)
+    def _on_brightness_synced(self, val):
+        prev = self.app.volume_states.get("brightness", val)
+        self.app.update_instant_vol("brightness", val)
+        # OSD ще на екрані і показує "передбачене" значення — уточнюємо реальним
+        if time.monotonic() < self._br_osd_until and abs(prev - val) > 0.005:
+            self.app.trigger_osd("volume", "Яскравість монітора", val, icon_text="☀️")
 
     # ------------------------------------------------------------------ енкодери
     def _get_enc_accel_multiplier(self, base_enc):
@@ -185,13 +239,14 @@ class ActionExecutor(QObject):
                 self._inject(pyautogui.scroll, -140 * extra_steps if is_r else 140 * extra_steps)
 
         elif act == "ENC:BRIGHTNESS":
-            step = 0.03 * accel
+            step = 0.03 * accel * (1 if is_r else -1)
             current_br = self.app.volume_states.get("brightness", 0.7)
-            new_br = min(1.0, current_br + step) if is_r else max(0.0, current_br - step)
+            new_br = max(0.0, min(1.0, current_br + step))
             self.app.update_instant_vol("brightness", new_br)
             with self._br_lock:
-                self._pending_brightness = new_br
+                self._pending_br_delta += step
             self._br_event.set()
+            self._br_osd_until = time.monotonic() + 1.5
             self.app.trigger_osd("volume", "Яскравість монітора", new_br, icon_text="☀️")
 
         elif act == "ENC:ZOOM":
@@ -228,9 +283,12 @@ class ActionExecutor(QObject):
             clean_app = target.replace(".exe", "").capitalize()
             self.app.trigger_osd("volume", f"Гучність: {clean_app}", new_vol, icon_text="🎚", app_exe=target)
 
-    def _handle_rotation(self, base_enc, is_r, hw):
+    def _handle_rotation(self, base_enc, is_r, hw, board_accel=None):
         rot_key = f"{base_enc}_R" if is_r else f"{base_enc}_L"
-        accel = self._get_enc_accel_multiplier(base_enc)
+        # Прошивка ≥1.1 міряє інтервал між клацаннями сама (точно, без впливу пачок USB);
+        # для старої прошивки — оцінка за часом приходу подій на ПК
+        local_accel = self._get_enc_accel_multiplier(base_enc)
+        accel = board_accel if board_accel is not None else local_accel
 
         rot_act = self.app.get_action(rot_key)
         center_act = self.app.get_enc_active_action(base_enc)
@@ -270,7 +328,7 @@ class ActionExecutor(QObject):
                 if base.endswith(sfx):
                     enc = base[:-len(sfx)]
                     if enc in ENC_IDS:
-                        self._handle_rotation(enc, is_r, hw)
+                        self._handle_rotation(enc, is_r, hw, _accel_from_flags(flags) if proto >= 2 else None)
                     return
 
             if base.endswith("_PRESSED"):

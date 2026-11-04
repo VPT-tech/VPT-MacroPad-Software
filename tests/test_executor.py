@@ -235,3 +235,88 @@ def test_hw_fired_mute_shows_osd(env):
     drain()
     assert app.osd == ["Звук вимкнено"]
     assert log == []
+
+
+def test_board_accel_flag_is_used(env):
+    """Прискорення, виміряне платою (:A<n>), має пріоритет над оцінкою за часом приходу подій."""
+    app, ex, log, drain, _ = env
+    app.actions["ENC_2"] = "ENC:TIMELINE"
+    ex.execute("ENC_2_RIGHT:A5", 2)
+    drain()
+    assert log.count(("key", "right", "tap")) == 5
+    log.clear()
+    time.sleep(0.2)                      # щоб і локальна оцінка дала 1
+    ex.execute("ENC_2_LEFT:HW:A3", 2)    # плата вже натиснула 1 раз -> ПК додає 2
+    drain()
+    assert log.count(("key", "left", "tap")) == 2
+
+
+def test_accel_flag_ignored_on_legacy_protocol(env):
+    app, ex, log, drain, _ = env
+    app.actions["ENC_2"] = "ENC:TIMELINE"
+    time.sleep(0.2)
+    ex.execute("ENC_2_RIGHT:A5", 1)      # v1 не має суфіксів — сміття ігнорується
+    drain()
+    assert log.count(("key", "right", "tap")) == 1
+
+
+class FakeMonitor:
+    def __init__(self, level):
+        self.level = level
+        self.sets = []
+        self.reads = 0
+
+    def get(self, allow_wmi=True):
+        self.reads += 1
+        return self.level
+
+    def set(self, val):
+        self.sets.append(round(val, 3))
+        self.level = val
+
+
+def test_brightness_starts_from_real_value_and_resyncs(qapp, monkeypatch):
+    mon = FakeMonitor(0.40)
+    monkeypatch.setattr(ae, "get_monitor_brightness", mon.get)
+    monkeypatch.setattr(ae, "set_monitor_brightness", mon.set)
+    app = FakeApp()
+    ex = ae.ActionExecutor(app)
+    # стартове зчитування доходить до UI (а не припущені 70%)
+    process_events_for(qapp, 150)
+    assert app.volume_states["brightness"] == pytest.approx(0.40)
+
+    app.actions["ENC_3"] = "ENC:BRIGHTNESS"
+    ex.execute("ENC_3_RIGHT:A1", 2)
+    process_events_for(qapp, 150)
+    assert mon.sets[-1] == pytest.approx(0.43)
+    assert app.volume_states["brightness"] == pytest.approx(0.43)
+
+    # Яскравість змінили кнопками монітора, а енкодер довго не чіпали ->
+    # перед наступним кроком значення перечитується, без "стрибка" від старого
+    mon.level = 0.80
+    ex._br_last_sync -= 100
+    ex.execute("ENC_3_RIGHT:A1", 2)
+    process_events_for(qapp, 200)
+    assert mon.sets[-1] == pytest.approx(0.83)
+    assert app.volume_states["brightness"] == pytest.approx(0.83)
+
+    # Швидкі кроки поспіль застосовуються відносно, без перечитування
+    reads = mon.reads
+    for _ in range(3):
+        ex.execute("ENC_3_LEFT:A1", 2)
+    process_events_for(qapp, 300)
+    assert mon.level == pytest.approx(0.74)
+    assert mon.reads == reads
+    assert app.volume_states["brightness"] == pytest.approx(0.74)
+
+
+def test_brightness_without_readback_keeps_old_behaviour(qapp, monkeypatch):
+    mon = FakeMonitor(None)
+    monkeypatch.setattr(ae, "get_monitor_brightness", mon.get)
+    monkeypatch.setattr(ae, "set_monitor_brightness", mon.set)
+    app = FakeApp()
+    ex = ae.ActionExecutor(app)
+    app.actions["ENC_3"] = "ENC:BRIGHTNESS"
+    ex.execute("ENC_3_RIGHT:A1", 2)
+    process_events_for(qapp, 150)
+    assert mon.sets[-1] == pytest.approx(0.73)

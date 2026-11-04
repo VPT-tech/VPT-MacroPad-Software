@@ -313,45 +313,105 @@ class _PHYSICAL_MONITOR(ctypes.Structure):
         ("szPhysicalMonitorDescription", ctypes.c_wchar * 128)
     ]
 
+def _for_each_physical_monitor(callback):
+    """Викликає callback(dxva2, h_physical_monitor) для кожного фізичного монітора (DDC/CI)
+    і повертає список результатів. Хендли моніторів гарантовано звільняються."""
+    results = []
+    user32 = ctypes.windll.user32
+    dxva2 = ctypes.windll.dxva2
+    hmonitors = []
+
+    MONITORENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_long * 4), ctypes.c_long
+    )
+
+    def _enum_cb(hMonitor, hdcMonitor, lprcMonitor, dwData):
+        hmonitors.append(hMonitor)
+        return 1
+
+    enum_cb = MONITORENUMPROC(_enum_cb)
+    user32.EnumDisplayMonitors(None, None, enum_cb, 0)
+
+    for hmon in hmonitors:
+        num_phys = ctypes.c_ulong(0)
+        if not dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(ctypes.c_void_p(hmon), ctypes.byref(num_phys)):
+            continue
+        count = num_phys.value
+        if count <= 0:
+            continue
+        phys_arr = (_PHYSICAL_MONITOR * count)()
+        if not dxva2.GetPhysicalMonitorsFromHMONITOR(ctypes.c_void_p(hmon), count, phys_arr):
+            continue
+        try:
+            for i in range(count):
+                try:
+                    results.append(callback(dxva2, ctypes.c_void_p(phys_arr[i].hPhysicalMonitor)))
+                except Exception:
+                    results.append(None)
+        finally:
+            dxva2.DestroyPhysicalMonitors(count, phys_arr)
+    return results
+
 def _set_ddc_brightness_winapi(lvl):
     """Нативне регулювання яскравості зовнішніх моніторів через системний dxva2.dll (DDC/CI VCP 0x10)."""
-    any_success = False
+    def _set_one(dxva2, h_phys):
+        # 0x10 — стандартний VCP-код яскравості (Luminance) у специфікації DDC/CI MCCS.
+        # SetMonitorBrightness — лише запасний варіант: дві DDC-команди
+        # поспіль на кожен крок перевантажують шину I2C деяких моніторів.
+        ok = dxva2.SetVCPFeature(h_phys, ctypes.c_ubyte(0x10), ctypes.c_ulong(lvl))
+        if not ok:
+            ok = dxva2.SetMonitorBrightness(h_phys, ctypes.c_ulong(lvl))
+        return bool(ok)
     try:
-        user32 = ctypes.windll.user32
-        dxva2 = ctypes.windll.dxva2
-        hmonitors = []
+        return any(r for r in _for_each_physical_monitor(_set_one))
+    except Exception:
+        return False
 
-        MONITORENUMPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_long * 4), ctypes.c_long
-        )
-
-        def _enum_cb(hMonitor, hdcMonitor, lprcMonitor, dwData):
-            hmonitors.append(hMonitor)
-            return 1
-
-        user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(_enum_cb), 0)
-
-        for hmon in hmonitors:
-            num_phys = ctypes.c_ulong(0)
-            if dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(ctypes.c_void_p(hmon), ctypes.byref(num_phys)):
-                count = num_phys.value
-                if count > 0:
-                    phys_arr = (_PHYSICAL_MONITOR * count)()
-                    if dxva2.GetPhysicalMonitorsFromHMONITOR(ctypes.c_void_p(hmon), count, phys_arr):
-                        for i in range(count):
-                            h_phys = ctypes.c_void_p(phys_arr[i].hPhysicalMonitor)
-                            # 0x10 — стандартний VCP-код яскравості (Luminance) у специфікації DDC/CI MCCS
-                            # SetMonitorBrightness — лише запасний варіант: дві DDC-команди
-                            # поспіль на кожен крок перевантажують шину I2C деяких моніторів.
-                            ok = dxva2.SetVCPFeature(h_phys, ctypes.c_ubyte(0x10), ctypes.c_ulong(lvl))
-                            if not ok:
-                                ok = dxva2.SetMonitorBrightness(h_phys, ctypes.c_ulong(lvl))
-                            if ok:
-                                any_success = True
-                        dxva2.DestroyPhysicalMonitors(count, phys_arr)
+def _get_ddc_brightness_winapi():
+    """Поточна яскравість першого монітора з DDC/CI (0.0..1.0) або None."""
+    def _get_one(dxva2, h_phys):
+        cur = ctypes.c_ulong(0)
+        mx = ctypes.c_ulong(0)
+        if dxva2.GetVCPFeatureAndVCPFeatureReply(h_phys, ctypes.c_ubyte(0x10), None,
+                                                 ctypes.byref(cur), ctypes.byref(mx)) and mx.value > 0:
+            return cur.value / mx.value
+        mn = ctypes.c_ulong(0)
+        cur = ctypes.c_ulong(0)
+        mx = ctypes.c_ulong(0)
+        if dxva2.GetMonitorBrightness(h_phys, ctypes.byref(mn), ctypes.byref(cur), ctypes.byref(mx)) \
+                and mx.value > mn.value:
+            return (cur.value - mn.value) / (mx.value - mn.value)
+        return None
+    try:
+        for val in _for_each_physical_monitor(_get_one):
+            if val is not None:
+                return max(0.0, min(1.0, float(val)))
     except Exception:
         pass
-    return any_success
+    return None
+
+def _get_wmi_brightness():
+    """Яскравість вбудованого екрана ноутбука/моноблока через WMI (0.0..1.0) або None. Повільно (~0.5–1 с)."""
+    try:
+        cmd = ('powershell -NoProfile -WindowStyle Hidden -Command "(Get-WmiObject -Namespace root/WMI '
+               '-Class WmiMonitorBrightness -ErrorAction Stop | Select-Object -First 1).CurrentBrightness"')
+        res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             creationflags=0x08000000, timeout=3, text=True)
+        if res.returncode == 0:
+            txt = (res.stdout or "").strip().splitlines()
+            if txt and txt[0].strip().isdigit():
+                return max(0.0, min(1.0, int(txt[0].strip()) / 100.0))
+    except Exception:
+        pass
+    return None
+
+def get_monitor_brightness(allow_wmi=True):
+    """Фактична яскравість (0.0..1.0) або None, якщо прочитати не вдалося.
+    Раніше програма просто припускала 70%, і перше ж клацання енкодера "стрибало"."""
+    val = _get_ddc_brightness_winapi()
+    if val is None and allow_wmi and _WMI_BRIGHTNESS_SUPPORTED:
+        val = _get_wmi_brightness()
+    return val
 
 def set_monitor_brightness(val_percent):
     """Встановлює яскравість зовнішніх моніторів (WinAPI DDC/CI) та екранів ноутбуків (WMI) від 0 до 100."""

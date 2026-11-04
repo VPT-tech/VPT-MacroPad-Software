@@ -17,19 +17,56 @@ from utils import get_app_path, get_foreground_exe
 # v2: прошивка позначає апаратно виконані події суфіксом ":HW".
 HOST_PROTO_VERSION = 2
 
+# Браузер дозволяє БУДЬ-ЯКОМУ сайту відкрити WebSocket на localhost, тому сервер приймає
+# лише розширення браузера та сторінки YouTube (якщо розширення підключається з content script).
+WS_ALLOWED_ORIGINS = frozenset({
+    "https://www.youtube.com",
+    "https://youtube.com",
+    "https://m.youtube.com",
+    "https://music.youtube.com",
+})
+WS_ALLOWED_ORIGIN_PREFIXES = ("chrome-extension://", "moz-extension://")
+
+
+def is_allowed_ws_origin(origin):
+    """Origin відсутній лише у не-браузерних клієнтів (локальні програми), їх дозволяємо."""
+    if origin is None:
+        return True
+    o = str(origin).strip().lower().rstrip("/")
+    if not o or o == "null":
+        return False
+    return o in WS_ALLOWED_ORIGINS or o.startswith(WS_ALLOWED_ORIGIN_PREFIXES)
+
+
+def _ws_request_origin(websocket):
+    """Origin з рукостискання (підтримка старого і нового API бібліотеки websockets)."""
+    req = getattr(websocket, "request", None)
+    headers = getattr(req, "headers", None) if req is not None else None
+    if headers is None:
+        headers = getattr(websocket, "request_headers", None)
+    if headers is None:
+        return None
+    try:
+        return headers.get("Origin")
+    except Exception:
+        return None
+
 
 class WebSocketServerThread(QThread):
-    def __init__(self):
+    def __init__(self, host="localhost", port=8765):
         super().__init__()
+        self.host = host
+        self.port = port
         self.clients = set()
         self.loop = None
         self.server = None
         self.is_running = True
+        self.rejected_origins = []
 
     async def start_server(self):
         self.loop = asyncio.get_running_loop()
         try:
-            async with websockets.serve(self.handler, "localhost", 8765) as server:
+            async with websockets.serve(self.handler, self.host, self.port) as server:
                 self.server = server
                 while self.is_running:
                     await asyncio.sleep(0.2)
@@ -43,6 +80,14 @@ class WebSocketServerThread(QThread):
             pass
 
     async def handler(self, websocket, *args):
+        origin = _ws_request_origin(websocket)
+        if not is_allowed_ws_origin(origin):
+            self.rejected_origins.append(origin)
+            try:
+                await websocket.close(code=1008, reason="origin not allowed")
+            except Exception:
+                pass
+            return
         self.clients.add(websocket)
         try:
             await websocket.wait_closed()
@@ -112,8 +157,8 @@ class SerialThread(QThread):
     # (рядок події, версія протоколу, на якій її отримано)
     macro_signal = Signal(str, int)
     status_signal = Signal(str, str)
-    # (підключено, версія протоколу, версія прошивки)
-    link_signal = Signal(bool, int, str)
+    # (підключено, версія протоколу, версія прошивки, причина останнього ресету плати: "" | "WDT")
+    link_signal = Signal(bool, int, str, str)
 
     # Службові відповіді прошивки, які не є подіями кнопок
     _CONTROL_PREFIXES = ("PONG_VPT_MACROPAD", "EEPROM_SAVED", "PROTO_OK:")
@@ -127,6 +172,7 @@ class SerialThread(QThread):
         self._connected = False
         self.proto = 1
         self.fw_version = ""
+        self.reset_reason = ""
 
     @property
     def is_connected(self):
@@ -163,14 +209,15 @@ class SerialThread(QThread):
         self._connected = False
         self.clear_queue()
         if was:
-            self.link_signal.emit(False, self.proto, self.fw_version)
+            self.link_signal.emit(False, self.proto, self.fw_version, "")
 
     @staticmethod
     def _readline(conn):
         return conn.readline(256).decode('utf-8', errors='ignore').strip()
 
     def _handshake(self, port_device):
-        """Відкриває порт і перевіряє, що це саме VPT MacroPad. Повертає (conn, proto, fw, early_lines)."""
+        """Відкриває порт і перевіряє, що це саме VPT MacroPad.
+        Повертає (conn, proto, fw, reset_reason, early_lines)."""
         temp_conn = serial.Serial(port_device, 115200, timeout=0.35, write_timeout=0.5)
         try:
             temp_conn.dtr = False
@@ -197,10 +244,10 @@ class SerialThread(QThread):
                     break
             if not found_pong:
                 temp_conn.close()
-                return None, 1, "", []
+                return None, 1, "", "", []
 
             # Узгодження версії протоколу. Стара прошивка мовчки ігнорує PROTO:x → лишаємось на v1.
-            proto, fw, early = 1, "", []
+            proto, fw, rst, early = 1, "", "", []
             temp_conn.write(f"PROTO:{HOST_PROTO_VERSION}\n".encode())
             temp_conn.flush()
             deadline = time.time() + 0.4
@@ -217,10 +264,12 @@ class SerialThread(QThread):
                     for p in parts[2:]:
                         if p.startswith("FW="):
                             fw = p[3:]
+                        elif p.startswith("RST="):
+                            rst = p[4:]
                     break
                 if not line.startswith(self._CONTROL_PREFIXES):
                     early.append(line)
-            return temp_conn, proto, fw, early
+            return temp_conn, proto, fw, rst, early
         except Exception:
             try: temp_conn.close()
             except Exception: pass
@@ -253,7 +302,7 @@ class SerialThread(QThread):
                     if not (is_vpt or is_rp2040):
                         continue
                     try:
-                        c, proto, fw, early = self._handshake(port.device)
+                        c, proto, fw, rst, early = self._handshake(port.device)
                     except Exception:
                         continue
                     if c is None:
@@ -261,11 +310,12 @@ class SerialThread(QThread):
                     conn = c
                     self.proto = proto
                     self.fw_version = fw
+                    self.reset_reason = rst
                     last_rx_or_ping = time.time()
                     awaiting_pong = False
                     self.clear_queue()
                     self._connected = True
-                    self.link_signal.emit(True, proto, fw)
+                    self.link_signal.emit(True, proto, fw, rst)
                     self.status_signal.emit("<font color='#00ff66'>⬤</font> Підключено", "#00ff66")
                     for line in early:
                         self.macro_signal.emit(line, proto)
