@@ -3,7 +3,7 @@
   "name": "VPT Pad — YouTube Control",
   "short_name": "VPT Pad YT",
   "version": "2.0.0",
-  "description": "Керування YouTube з макропада VPT | Pad: пауза, перемотка, гучність, швидкість, наступне відео, субтитри. Керує лише однією — потрібною — вкладкою.",
+  "description": "Керування YouTube з макропада VPT | Pad: пауза, перемотка, гучність, швидкість, наступне відео, субтитри.",
   "minimum_chrome_version": "116",
   "permissions": ["scripting", "storage", "alarms"],
   "host_permissions": [

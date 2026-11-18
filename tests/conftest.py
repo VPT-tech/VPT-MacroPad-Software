@@ -75,6 +75,16 @@ _install_stubs()
 import pytest  # noqa: E402
 
 
+@pytest.fixture
+def fresh_config():
+    """Кожен тест з вікном програми стартує з чистим конфігом (стандартні профілі)."""
+    import config
+    for f in (config.CONFIG_FILE, config.CONFIG_FILE + ".bak", config.CONFIG_FILE + ".tmp"):
+        if os.path.exists(f):
+            os.remove(f)
+    yield
+
+
 @pytest.fixture(scope="session")
 def qapp():
     from PySide6.QtWidgets import QApplication

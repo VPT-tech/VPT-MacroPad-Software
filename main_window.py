@@ -8,6 +8,7 @@ import webbrowser
 import subprocess
 import ctypes
 import ctypes.wintypes
+import logging
 import pyautogui, keyboard
 
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -34,8 +35,7 @@ import html
 
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
-HW_BUTTON_IDS = [f"BTN_{i}" for i in range(1, 10)] + [f"ENC_{i}_SW" for i in range(1, 4)]
-HW_SLOTS = (("tap", "TAP"), ("dtap", "DTAP"), ("hold", "HOLD"))
+log = logging.getLogger("vpt")
 
 
 def sanitize_profile(prof, fallback_name="Профіль"):
@@ -106,7 +106,7 @@ class MacroPadPro(QMainWindow):
 
         # Синхронізація з платою: що вже відправлено (тіньова копія) + відкладений flush
         self._hw_shadow = {}
-        self._hw_save_pending = False
+        self._eeprom_specs = None   # що програма востаннє записала у флеш плати (профіль "без програми")
         self.device_connected = False
         self.hw_proto = 1
         self.fw_version = ""
@@ -218,55 +218,87 @@ class MacroPadPro(QMainWindow):
         return self._get_enc_dir_hid_spec(base_enc, is_right).startswith("HID_")
 
     def compute_hw_specs(self):
-        """Повна апаратна конфігурація поточного профілю: {ціль SET_KEY: spec}."""
-        specs = {}
-        for bid in HW_BUTTON_IDS:
-            tr = self.get_button_triggers(bid)
-            # Прошивка не вміє змішувати HID і SERIAL в одній кнопці: якщо хоч один слот
-            # потребує ПК — кнопку повністю обробляє ПК.
-            any_serial = any(action_to_hid_spec(v) == "SERIAL" for v in tr.values() if v != "NONE")
-            for slot_key, slot_name in HW_SLOTS:
-                val = tr.get(slot_key, "NONE")
-                specs[f"{bid}:{slot_name}"] = "SERIAL" if (any_serial and val != "NONE") else action_to_hid_spec(val)
-        for i in range(1, 4):
-            base_enc = f"ENC_{i}"
-            specs[f"{base_enc}_L"] = self._get_enc_dir_hid_spec(base_enc, False)
-            specs[f"{base_enc}_R"] = self._get_enc_dir_hid_spec(base_enc, True)
-        return specs
+        """Прив'язки плати для активного профілю (поки працює програма): {ціль SET_KEY: spec}."""
+        profiles = self.config.get("PROFILES", [])
+        if not profiles or not (0 <= self.active_profile_idx < len(profiles)):
+            return profile_to_hw_specs({})
+        return profile_to_hw_specs(profiles[self.active_profile_idx], enc_mode_indices=self.enc_mode_indices)
+
+    # ---- профіль "без програми": зберігається у флеші плати і працює, коли програма не запущена
+    def standalone_profile_index(self):
+        profiles = self.config.get("PROFILES", [])
+        try:
+            idx = int(self.config.get("standalone_profile", 0))
+        except (TypeError, ValueError):
+            idx = 0
+        return max(0, min(idx, len(profiles) - 1)) if profiles else 0
+
+    def set_standalone_profile(self, idx):
+        self.config["standalone_profile"] = int(idx)
+        self.save_config()
+        self.sync_hardware_bindings(immediate=True)
+
+    def compute_standalone_specs(self):
+        profiles = self.config.get("PROFILES", [])
+        if not profiles:
+            return profile_to_hw_specs({}, standalone=True)
+        return profile_to_hw_specs(profiles[self.standalone_profile_index()], standalone=True)
+
+    def _diff_cmds(self, specs):
+        cmds = []
+        for target, spec in specs.items():
+            if self._hw_shadow.get(target) != spec:
+                cmds.append(f"SET_KEY:{target}:{spec}")
+                self._hw_shadow[target] = spec
+        return cmds
 
     def sync_hardware_bindings(self, save_eeprom=False, immediate=False):
-        """Планує відправку конфігурації поточного профілю на плату RP2040.
-        Кілька змін поспіль зливаються в одну відправку; надсилаються лише змінені рядки."""
-        if save_eeprom:
-            self._hw_save_pending = True
+        """Планує відправку прив'язок на плату RP2040. Кілька змін поспіль зливаються
+        в одну відправку; надсилаються лише змінені рядки. Профіль "без програми"
+        перезаписується у флеш лише коли він справді змінився (save_eeprom лишено для сумісності)."""
         if immediate:
             self._hw_sync_timer.stop()
             self._flush_hw_sync()
         else:
             self._hw_sync_timer.start()
 
-    def _flush_hw_sync(self, force=False):
+    def _flush_hw_sync(self):
         st = getattr(self, 'serial_thread', None)
         if st is None or not self.device_connected:
-            return  # після підключення буде повна синхронізація (і SAVE_EEPROM, якщо він очікує)
+            return  # після підключення буде повна синхронізація
         cmds = []
-        for target, spec in self.compute_hw_specs().items():
-            if force or self._hw_shadow.get(target) != spec:
-                cmds.append(f"SET_KEY:{target}:{spec}")
-                self._hw_shadow[target] = spec
-        if self._hw_save_pending:
+        standalone = self.compute_standalone_specs()
+        if standalone != self._eeprom_specs:
+            # Флеш плати зберігає те, що зараз в її пам'яті, тож спершу ставимо туди профіль
+            # "без програми", зберігаємо, а потім повертаємо активний профіль.
+            cmds += self._diff_cmds(standalone)
             cmds.append("SAVE_EEPROM")
-            self._hw_save_pending = False
+            self._eeprom_specs = standalone
+        cmds += self._diff_cmds(self.compute_hw_specs())
         st.send_commands(cmds)
+
+    def restore_board_standalone(self):
+        """Перед виходом: плата переходить на профіль "без програми" — як після перепідключення.
+        Інакше в її пам'яті лишаються прив'язки, яким потрібна програма."""
+        st = getattr(self, 'serial_thread', None)
+        if st is None or not self.device_connected:
+            return
+        cmds = self._diff_cmds(self.compute_standalone_specs())
+        cmds.append("LOAD_EEPROM")   # прошивка ≥1.2 перечитає флеш; стара мовчки ігнорує
+        st.send_commands(cmds)
+        log.info("board switched to the standalone profile before exit")
 
     def on_link_changed(self, connected, proto, fw_version, reset_reason=""):
         self.device_connected = bool(connected)
         self.hw_proto = proto
         self.fw_version = fw_version
         if connected:
+            log.info("board connected: firmware %s, protocol v%s%s", fw_version or "<=1.0", proto,
+                     ", reset by watchdog" if reset_reason == "WDT" else "")
             self._hw_shadow.clear()
+            self._eeprom_specs = None   # флеш перезаписується при кожному підключенні (без змін — без стирання)
             self._hw_sync_timer.stop()
-            self._flush_hw_sync(force=True)
+            self._flush_hw_sync()
             fw = fw_version or "≤ 1.0"
             tip = f"Прошивка: {fw}  •  протокол v{proto}"
             if reset_reason == "WDT":
@@ -282,6 +314,7 @@ class MacroPadPro(QMainWindow):
                 self.trigger_osd("status", "Плату перезапущено (watchdog)", is_danger=True, icon_text="warning")
             self.lbl_status.setToolTip(tip)
         else:
+            log.info("board disconnected")
             self._hw_shadow.clear()
             self.lbl_status.setToolTip("")
             # Плата зникла під час утримання кнопки — відпускаємо все, що тримає ПК
@@ -880,6 +913,17 @@ class MacroPadPro(QMainWindow):
         self.refresh_profiles_ui()
         self.switch_profile(len(profiles) - 1)
 
+    def restore_default_profiles(self):
+        """Замінює всі профілі стандартними (Медіа, NumPad, Офіс і браузер)."""
+        self.config["PROFILES"] = [copy.deepcopy(p) for p in BUILTIN_PRESETS.values()]
+        self.config["standalone_profile"] = 0
+        self._enc_mode_by_prof.clear()
+        self.active_profile_idx = 0
+        self.is_in_auto_profile = False
+        self.save_config()
+        self.refresh_profiles_ui()
+        self.switch_profile(0)
+
     def duplicate_profile(self, idx):
         profiles = self.config.get("PROFILES", [])
         if not (0 <= idx < len(profiles)):
@@ -1007,6 +1051,8 @@ class MacroPadPro(QMainWindow):
         # Збережені індекси "повернення" теж зсуваються
         fb = getattr(self, 'fallback_profile_idx', 0)
         self.fallback_profile_idx = fb - 1 if fb > idx else (0 if fb == idx else fb)
+        sa = self.standalone_profile_index()
+        self.config["standalone_profile"] = sa - 1 if sa > idx else (0 if sa == idx else sa)
         self.executor._temp_profile_holds = {
             k: (v - 1 if v > idx else v) for k, v in self.executor._temp_profile_holds.items() if v != idx
         }
@@ -2390,6 +2436,8 @@ class MacroPadPro(QMainWindow):
         self.activateWindow()
 
     def quit_app(self):
+        log.info("quit requested from the tray menu / updater")
+        self.restore_board_standalone()
         self.tray_icon.hide()
         self.cleanup_threads()
         from PySide6.QtWidgets import QApplication
@@ -2412,6 +2460,8 @@ class MacroPadPro(QMainWindow):
     def closeEvent(self, event):
         event.ignore()
         self.hide()
+        log.info("window hidden to tray (tray available: %s, icon visible: %s)",
+                 QSystemTrayIcon.isSystemTrayAvailable(), self.tray_icon.isVisible())
         # Один раз пояснюємо, що програма не закрилась, а працює у фоні
         if not self.config.get("tray_hint_shown", False):
             self.config["tray_hint_shown"] = True
@@ -2419,7 +2469,8 @@ class MacroPadPro(QMainWindow):
             try:
                 self.tray_icon.showMessage(
                     "VPT | Pad працює у фоні",
-                    "Макропад і далі активний. Відкрити вікно або вийти можна через значок у треї.",
+                    "Значок програми — у треї біля годинника (можливо, під стрілкою ˄). "
+                    "Через нього можна відкрити вікно, змінити профіль або вийти.",
                     QSystemTrayIcon.MessageIcon.Information, 6000)
             except Exception:
                 pass

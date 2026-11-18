@@ -501,6 +501,17 @@ class SerialThread(QThread):
                 time.sleep(0.5)
 
         if conn:
+            # Останні команди (напр. повернення плати до профілю "без програми" перед виходом)
+            # мають дійти до плати, навіть якщо потік зупинили одразу після них
+            with self.queue_lock:
+                pending_cmds = list(self.cmd_queue)
+                self.cmd_queue.clear()
+            if pending_cmds:
+                try:
+                    conn.write("".join(f"{c}\n" for c in pending_cmds).encode('utf-8'))
+                    conn.flush()
+                except Exception:
+                    pass
             try: conn.close()
             except Exception: pass
         self._connected = False

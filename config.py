@@ -44,6 +44,22 @@ FRIENDLY_NAMES = {
     "HOTKEY:ctrl+a": "Виділити все",
     "HOTKEY:ctrl+s": "Зберегти",
     "HOTKEY:alt+f4": "Закрити вікно",
+    "HOTKEY:ctrl+y": "Повторити",
+    "HOTKEY:ctrl+f": "Пошук",
+    "HOTKEY:alt+tab": "Перемкнути вікно",
+    "HOTKEY:win+e": "Провідник",
+    "HOTKEY:ctrl+0": "Масштаб 100%",
+    "HOTKEY:ctrl+t": "Нова вкладка",
+    "HOTKEY:ctrl+w": "Закрити вкладку",
+    "HOTKEY:ctrl+tab": "Наступна вкладка",
+    "HOTKEY:ctrl+shift+tab": "Попередня вкладка",
+    "HOTKEY:mouse_middle": "Середня кнопка миші",
+    "HOTKEY:backspace": "Backspace",
+    "HOTKEY:left": "Стрілка ←",
+    "HOTKEY:right": "Стрілка →",
+    "HOTKEY:up": "Стрілка ↑",
+    "HOTKEY:down": "Стрілка ↓",
+    "HOTKEY:num enter": "Num Enter",
     "CMD:start spotify:": "Spotify",
     "EXT:YT_FWD": "Ютуб: Вперед",
     "EXT:YT_BACK": "Ютуб: Назад",
@@ -257,143 +273,151 @@ def encoder_action_to_hid_spec(act: str, is_right: bool) -> str:
         return action_to_hid_spec("HOTKEY:ctrl+y" if is_right else "HOTKEY:ctrl+z")
     return action_to_hid_spec(act)
 
+def _btn(tap="NONE", dtap="NONE", hold="NONE"):
+    return {"tap": tap, "dtap": dtap, "hold": hold}
+
+
+# Стандартні профілі "з коробки". Спільні правила для всіх профілів:
+#   * нижня крутилка (ENC_3) — гучність системи; натискання — дія профілю,
+#     утримання — наступний профіль (працює, коли запущена програма);
+#   * без програми плата виконує все, що можна зробити клавіатурою/мишею/медіаклавішами
+#     (профіль 1 вбудований у прошивку, тож нова плата працює ще до встановлення програми).
 BUILTIN_PRESETS = {
-    "Мультимедіа": {
-        "name": "Мультимедіа",
+    "Медіа": {
+        "name": "Медіа",
         "app_bind": "",
         "actions": {
-            "BTN_1": {"tap": "MED:PREV", "dtap": "NONE", "hold": "NONE"},
-            "BTN_2": {"tap": "MED:PLAY", "dtap": "MED:NEXT", "hold": "MED:MUTE"},
-            "BTN_3": {"tap": "MED:NEXT", "dtap": "NONE", "hold": "NONE"},
-            "BTN_4": {"tap": "HOTKEY:ctrl+c", "dtap": "HOTKEY:ctrl+x", "hold": "NONE"},
-            "BTN_5": {"tap": "HOTKEY:ctrl+v", "dtap": "HOTKEY:ctrl+z", "hold": "NONE"},
-            "BTN_6": {"tap": "SYS:SNIP", "dtap": "NONE", "hold": "SYS:TASK"},
-            "BTN_7": {"tap": "MED:MIC_MUTE", "dtap": "NONE", "hold": "NONE"},
-            "BTN_8": {"tap": "SYS:DESKTOP", "dtap": "NONE", "hold": "SYS:LOCK"},
-            "BTN_9": {"tap": "SYS:PROFILE_NEXT", "dtap": "SYS:PROFILE_PREV", "hold": "NONE"},
-            "ENC_1": "ENC:VOL",
-            "ENC_1_SW": {"tap": "ENC:MODE_TOGGLE", "dtap": "MED:MUTE", "hold": "NONE"},
-            "ENC_2": "ENC:SCROLL",
-            "ENC_2_SW": {"tap": "MED:MIC_MUTE", "dtap": "NONE", "hold": "NONE"},
-            "ENC_3": "ENC:BRIGHTNESS",
-            "ENC_3_SW": {"tap": "EXT:YT_PLAYPAUSE", "dtap": "NONE", "hold": "NONE"}
-        },
-        "enc_modes": {
-            "ENC_1": ["ENC:VOL", "ENC:APP:discord.exe", "ENC:APP:spotify.exe"]
-        }
-    },
-    "Blender 3D": {
-        "name": "Blender 3D",
-        "app_bind": "blender.exe",
-        "actions": {
-            "BTN_1": {"tap": "HOTKEY:num 1", "dtap": "HOTKEY:ctrl+num 1", "hold": "NONE"},
-            "BTN_2": {"tap": "HOTKEY:num 3", "dtap": "HOTKEY:ctrl+num 3", "hold": "NONE"},
-            "BTN_3": {"tap": "HOTKEY:num 7", "dtap": "HOTKEY:ctrl+num 7", "hold": "NONE"},
-            "BTN_4": {"tap": "HOTKEY:g", "dtap": "HOTKEY:r", "hold": "HOTKEY:s"},
-            "BTN_5": {"tap": "HOTKEY:tab", "dtap": "HOTKEY:z", "hold": "NONE"},
-            "BTN_6": {"tap": "HOTKEY:e", "dtap": "HOTKEY:i", "hold": "HOTKEY:ctrl+b"},
-            "BTN_7": {"tap": "HOTKEY:shift+a", "dtap": "HOTKEY:x", "hold": "NONE"},
-            "BTN_8": {"tap": "HOTKEY:ctrl+z", "dtap": "HOTKEY:ctrl+shift+z", "hold": "HOTKEY:ctrl+s"},
-            "BTN_9": {"tap": "SYS:PROFILE_NEXT", "dtap": "NONE", "hold": "NONE"},
-            "ENC_1": "ENC:ZOOM",
-            "ENC_1_SW": {"tap": "HOTKEY:num .", "dtap": "NONE", "hold": "NONE"},
-            "ENC_2": "ENC:BRUSH",
-            "ENC_2_SW": {"tap": "HOTKEY:num 0", "dtap": "NONE", "hold": "NONE"},
-            "ENC_3": "ENC:TIMELINE",
-            "ENC_3_SW": {"tap": "HOTKEY:space", "dtap": "NONE", "hold": "NONE"}
-        }
-    },
-    "Photoshop": {
-        "name": "Photoshop",
-        "app_bind": "photoshop.exe",
-        "actions": {
-            "BTN_1": {"tap": "HOTKEY:b", "dtap": "HOTKEY:e", "hold": "NONE"},
-            "BTN_2": {"tap": "HOTKEY:v", "dtap": "HOTKEY:m", "hold": "NONE"},
-            "BTN_3": {"tap": "HOTKEY:l", "dtap": "HOTKEY:w", "hold": "NONE"},
-            "BTN_4": {"tap": "HOTKEY:ctrl+t", "dtap": "HOTKEY:ctrl+d", "hold": "NONE"},
-            "BTN_5": {"tap": "HOTKEY:ctrl+shift+n", "dtap": "HOTKEY:ctrl+j", "hold": "NONE"},
-            "BTN_6": {"tap": "HOTKEY:x", "dtap": "HOTKEY:d", "hold": "NONE"},
-            "BTN_7": {"tap": "HOTKEY:ctrl+z", "dtap": "HOTKEY:ctrl+shift+z", "hold": "NONE"},
-            "BTN_8": {"tap": "HOTKEY:space", "dtap": "HOTKEY:ctrl+0", "hold": "HOTKEY:ctrl+s"},
-            "BTN_9": {"tap": "SYS:PROFILE_NEXT", "dtap": "NONE", "hold": "NONE"},
-            "ENC_1": "ENC:BRUSH",
-            "ENC_1_SW": {"tap": "ENC:MODE_TOGGLE", "dtap": "NONE", "hold": "NONE"},
-            "ENC_2": "ENC:ZOOM",
-            "ENC_2_SW": {"tap": "HOTKEY:ctrl+0", "dtap": "NONE", "hold": "NONE"},
-            "ENC_3": "ENC:UNDO_REDO",
-            "ENC_3_SW": {"tap": "MED:PLAY", "dtap": "NONE", "hold": "NONE"}
-        },
-        "enc_modes": {
-            "ENC_1": ["ENC:BRUSH", "ENC:ZOOM"]
-        }
-    },
-    "Premiere Pro": {
-        "name": "Premiere Pro",
-        "app_bind": "adobe premiere pro.exe",
-        "actions": {
-            "BTN_1": {"tap": "HOTKEY:v", "dtap": "HOTKEY:a", "hold": "NONE"},
-            "BTN_2": {"tap": "HOTKEY:c", "dtap": "HOTKEY:ctrl+k", "hold": "NONE"},
-            "BTN_3": {"tap": "HOTKEY:delete", "dtap": "HOTKEY:shift+delete", "hold": "NONE"},
-            "BTN_4": {"tap": "HOTKEY:i", "dtap": "HOTKEY:o", "hold": "NONE"},
-            "BTN_5": {"tap": "HOTKEY:space", "dtap": "HOTKEY:l", "hold": "NONE"},
-            "BTN_6": {"tap": "HOTKEY:m", "dtap": "NONE", "hold": "NONE"},
-            "BTN_7": {"tap": "HOTKEY:ctrl+z", "dtap": "HOTKEY:ctrl+shift+z", "hold": "NONE"},
-            "BTN_8": {"tap": "HOTKEY:ctrl+s", "dtap": "HOTKEY:ctrl+m", "hold": "NONE"},
-            "BTN_9": {"tap": "SYS:PROFILE_NEXT", "dtap": "NONE", "hold": "NONE"},
-            "ENC_1": "ENC:TIMELINE",
-            "ENC_1_SW": {"tap": "HOTKEY:space", "dtap": "NONE", "hold": "NONE"},
-            "ENC_2": "ENC:ZOOM",
-            "ENC_2_SW": {"tap": "HOTKEY:\\", "dtap": "NONE", "hold": "NONE"},
-            "ENC_3": "ENC:VOL",
-            "ENC_3_SW": {"tap": "MED:MUTE", "dtap": "NONE", "hold": "NONE"}
-        }
-    },
-    "VS Code": {
-        "name": "VS Code",
-        "app_bind": "code.exe",
-        "actions": {
-            "BTN_1": {"tap": "HOTKEY:ctrl+p", "dtap": "HOTKEY:ctrl+shift+p", "hold": "NONE"},
-            "BTN_2": {"tap": "HOTKEY:ctrl+/", "dtap": "HOTKEY:shift+alt+f", "hold": "NONE"},
-            "BTN_3": {"tap": "HOTKEY:ctrl+`", "dtap": "HOTKEY:ctrl+b", "hold": "NONE"},
-            "BTN_4": {"tap": "HOTKEY:ctrl+f", "dtap": "HOTKEY:ctrl+h", "hold": "NONE"},
-            "BTN_5": {"tap": "HOTKEY:f5", "dtap": "HOTKEY:ctrl+f5", "hold": "NONE"},
-            "BTN_6": {"tap": "HOTKEY:alt+up", "dtap": "HOTKEY:alt+down", "hold": "NONE"},
-            "BTN_7": {"tap": "HOTKEY:ctrl+c", "dtap": "HOTKEY:ctrl+v", "hold": "NONE"},
-            "BTN_8": {"tap": "HOTKEY:ctrl+z", "dtap": "HOTKEY:ctrl+s", "hold": "NONE"},
-            "BTN_9": {"tap": "SYS:PROFILE_NEXT", "dtap": "NONE", "hold": "NONE"},
+            "BTN_1": _btn("MED:PREV"),
+            "BTN_2": _btn("MED:PLAY"),
+            "BTN_3": _btn("MED:NEXT"),
+            "BTN_4": _btn("HOTKEY:win+e"),
+            "BTN_5": _btn("MED:MIC_MUTE"),
+            "BTN_6": _btn("SYS:SNIP"),
+            "BTN_7": _btn("SYS:DESKTOP"),
+            "BTN_8": _btn("SYS:TASK"),
+            "BTN_9": _btn("SYS:LOCK"),
             "ENC_1": "ENC:SCROLL",
-            "ENC_1_SW": {"tap": "ENC:MODE_TOGGLE", "dtap": "NONE", "hold": "NONE"},
+            "ENC_1_SW": _btn("HOTKEY:mouse_middle"),
             "ENC_2": "ENC:ZOOM",
-            "ENC_2_SW": {"tap": "MED:PLAY", "dtap": "NONE", "hold": "NONE"},
+            "ENC_2_SW": _btn("HOTKEY:ctrl+0"),
             "ENC_3": "ENC:VOL",
-            "ENC_3_SW": {"tap": "MED:MIC_MUTE", "dtap": "NONE", "hold": "NONE"}
-        }
-    },
-    "CS2 (Gaming)": {
-        "name": "CS2 (Gaming)",
-        "app_bind": "cs2.exe",
-        "actions": {
-            "BTN_1": {"tap": "HOTKEY:f13", "dtap": "NONE", "hold": "NONE"},
-            "BTN_2": {"tap": "HOTKEY:f14", "dtap": "NONE", "hold": "NONE"},
-            "BTN_3": {"tap": "HOTKEY:f15", "dtap": "NONE", "hold": "NONE"},
-            "BTN_4": {"tap": "HOTKEY:f16", "dtap": "NONE", "hold": "NONE"},
-            "BTN_5": {"tap": "HOTKEY:f17", "dtap": "NONE", "hold": "NONE"},
-            "BTN_6": {"tap": "HOTKEY:f18", "dtap": "NONE", "hold": "NONE"},
-            "BTN_7": {"tap": "MED:MIC_MUTE", "dtap": "NONE", "hold": "NONE"},
-            "BTN_8": {"tap": "MED:PLAY", "dtap": "MED:NEXT", "hold": "NONE"},
-            "BTN_9": {"tap": "SYS:PROFILE_NEXT", "dtap": "NONE", "hold": "NONE"},
-            "ENC_1": "ENC:VOL",
-            "ENC_1_SW": {"tap": "ENC:MODE_TOGGLE", "dtap": "MED:MUTE", "hold": "NONE"},
-            "ENC_2": "ENC:APP:discord.exe",
-            "ENC_2_SW": {"tap": "APP_MUTE:discord.exe", "dtap": "NONE", "hold": "NONE"},
-            "ENC_3": "ENC:BRIGHTNESS",
-            "ENC_3_SW": {"tap": "SYS:SNIP", "dtap": "NONE", "hold": "NONE"}
+            "ENC_3_SW": _btn("MED:MUTE", hold="SYS:PROFILE_NEXT"),
         },
-        "enc_modes": {
-            "ENC_1": ["ENC:VOL", "ENC:APP:discord.exe"]
-        }
-    }
+    },
+    "NumPad": {
+        "name": "NumPad",
+        "app_bind": "",
+        "actions": {
+            # розкладка як на цифровому блоці клавіатури: 7-8-9 зверху
+            "BTN_1": _btn("HOTKEY:num 7"),
+            "BTN_2": _btn("HOTKEY:num 8"),
+            "BTN_3": _btn("HOTKEY:num 9"),
+            "BTN_4": _btn("HOTKEY:num 4"),
+            "BTN_5": _btn("HOTKEY:num 5"),
+            "BTN_6": _btn("HOTKEY:num 6"),
+            "BTN_7": _btn("HOTKEY:num 1"),
+            "BTN_8": _btn("HOTKEY:num 2"),
+            "BTN_9": _btn("HOTKEY:num 3"),
+            "ENC_1_L": "HOTKEY:left",
+            "ENC_1_R": "HOTKEY:right",
+            "ENC_1_SW": _btn("HOTKEY:num 0", hold="HOTKEY:num ."),
+            "ENC_2_L": "HOTKEY:up",
+            "ENC_2_R": "HOTKEY:down",
+            "ENC_2_SW": _btn("HOTKEY:num enter", hold="HOTKEY:num +"),
+            "ENC_3": "ENC:VOL",
+            "ENC_3_SW": _btn("HOTKEY:backspace", hold="SYS:PROFILE_NEXT"),
+        },
+    },
+    "Офіс і браузер": {
+        "name": "Офіс і браузер",
+        "app_bind": "",
+        "actions": {
+            "BTN_1": _btn("HOTKEY:ctrl+c"),
+            "BTN_2": _btn("HOTKEY:ctrl+v"),
+            "BTN_3": _btn("HOTKEY:ctrl+x"),
+            "BTN_4": _btn("HOTKEY:ctrl+z"),
+            "BTN_5": _btn("HOTKEY:ctrl+y"),
+            "BTN_6": _btn("HOTKEY:ctrl+s"),
+            "BTN_7": _btn("HOTKEY:ctrl+a"),
+            "BTN_8": _btn("HOTKEY:ctrl+f"),
+            "BTN_9": _btn("HOTKEY:alt+tab"),
+            "ENC_1": "ENC:SCROLL",
+            "ENC_1_SW": _btn("HOTKEY:mouse_middle"),
+            "ENC_2_L": "HOTKEY:ctrl+shift+tab",
+            "ENC_2_R": "HOTKEY:ctrl+tab",
+            "ENC_2_SW": _btn("HOTKEY:ctrl+t", hold="HOTKEY:ctrl+w"),
+            "ENC_3": "ENC:VOL",
+            "ENC_3_SW": _btn("MED:MUTE", hold="SYS:PROFILE_NEXT"),
+        },
+    },
 }
+
+# ----------------------------------------------------------------- профіль -> прив'язки плати
+HW_BUTTON_IDS = [f"BTN_{i}" for i in range(1, 10)] + [f"ENC_{i}_SW" for i in range(1, 4)]
+HW_SLOTS = (("tap", "TAP"), ("dtap", "DTAP"), ("hold", "HOLD"))
+
+
+def profile_button_triggers(prof, bid):
+    raw = (prof.get("actions") or {}).get(bid, "NONE")
+    if isinstance(raw, dict):
+        return {s: (raw.get(s) or "NONE") for s in ("tap", "dtap", "hold")}
+    return {"tap": raw or "NONE", "dtap": "NONE", "hold": "NONE"}
+
+
+def profile_action(prof, bid):
+    raw = (prof.get("actions") or {}).get(bid, "NONE")
+    if isinstance(raw, dict):
+        return raw.get("tap") or "NONE"
+    return raw or "NONE"
+
+
+def profile_enc_active_action(prof, base_enc, mode_idx=0):
+    modes = (prof.get("enc_modes") or {}).get(base_enc, [])
+    if not modes:
+        return profile_action(prof, base_enc)
+    return modes[mode_idx % len(modes)]
+
+
+def profile_to_hw_specs(prof, standalone=False, enc_mode_indices=None):
+    """Прив'язки плати для профілю: {ціль SET_KEY: spec}.
+
+    standalone=False — профіль, поки працює програма: кнопку, якій хоч один слот потребує ПК,
+    повністю обробляє ПК (прошивка не змішує HID і SERIAL в одній кнопці).
+    standalone=True — профіль для роботи без програми (зберігається у флеші плати):
+    усе, що плата вміє сама, лишається; дії, яким потрібна програма, стають порожніми.
+    """
+    enc_mode_indices = enc_mode_indices or {}
+    specs = {}
+    for bid in HW_BUTTON_IDS:
+        tr = profile_button_triggers(prof, bid)
+        slot_specs = {k: action_to_hid_spec(v) for k, v in tr.items()}
+        any_serial = any(sp == "SERIAL" for sp in slot_specs.values())
+        for slot_key, slot_name in HW_SLOTS:
+            sp = slot_specs[slot_key]
+            if standalone:
+                if sp == "SERIAL":
+                    sp = "NONE"
+            elif any_serial and tr[slot_key] != "NONE":
+                sp = "SERIAL"
+            specs[f"{bid}:{slot_name}"] = sp
+    for i in range(1, 4):
+        base = f"ENC_{i}"
+        center = profile_enc_active_action(prof, base, enc_mode_indices.get(base, 0))
+        for sfx, is_r in (("_L", False), ("_R", True)):
+            side = profile_action(prof, base + sfx)
+            if side != "NONE" and center != "NONE":
+                # обидві дії разом виконує лише програма; без неї — бічна (явна для напрямку)
+                sp = encoder_action_to_hid_spec(side, is_r) if standalone else "SERIAL"
+            elif side != "NONE":
+                sp = encoder_action_to_hid_spec(side, is_r)
+            elif center != "NONE":
+                sp = encoder_action_to_hid_spec(center, is_r)
+            else:
+                sp = "NONE"
+            if standalone and sp == "SERIAL":
+                sp = "NONE"
+            specs[f"{base}{sfx}"] = sp
+    return specs
 
 STYLESHEET = f"""
 QMainWindow, QDialog, QInputDialog {{ background-color: {BG_MAIN}; color: {TEXT_MAIN}; }}

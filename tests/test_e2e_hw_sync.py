@@ -23,7 +23,26 @@ SIM_BINS = {
 }
 
 # Піни з прошивки
-PIN_BTN1, PIN_BTN4, PIN_BTN7 = 20, 19, 18
+PIN_BTN1, PIN_BTN5, PIN_ENC2_SW = 20, 27, 6
+
+ENC_TARGETS = {f"ENC_{i}_{d}" for i in (1, 2, 3) for d in "LR"}
+
+
+def board_state(rx):
+    """Відтворює стан плати з прийнятих нею команд: (пам'ять, вміст флешу)."""
+    ram, saved = {}, None
+    for line in rx:
+        if line.startswith("SET_KEY:"):
+            parts = line[len("SET_KEY:"):].split(":")
+            if parts[0] in ENC_TARGETS:
+                ram[parts[0]] = ":".join(parts[1:])
+            else:
+                ram[f"{parts[0]}:{parts[1]}"] = ":".join(parts[2:])
+        elif line == "SAVE_EEPROM":
+            saved = dict(ram)
+        elif line == "LOAD_EEPROM" and saved is not None:
+            ram = dict(saved)
+    return ram, saved
 
 
 class SimSerial:
@@ -140,7 +159,7 @@ def firmware(request):
     return request.param, os.path.join(SIM_DIR, target)
 
 
-def test_e2e_sync_and_no_double_execution(qapp, monkeypatch, firmware):
+def test_e2e_sync_and_no_double_execution(qapp, monkeypatch, firmware, fresh_config):
     fw_kind, sim_bin = firmware
     proc = subprocess.Popen([sim_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     sim = SimSerial(proc)
@@ -167,17 +186,22 @@ def test_e2e_sync_and_no_double_execution(qapp, monkeypatch, firmware):
     try:
         # 1. Рукостискання: протокол v2 і версія прошивки; стара прошивка -> v1
         assert wait_until(qapp, lambda: w.device_connected, 6.0), "плата не підключилась"
+        n_set = lambda: sum(1 for r in sim.rx if r.startswith("SET_KEY:"))
         if fw_kind == "current":
-            assert (w.hw_proto, w.fw_version) == (2, "1.1.0")
+            assert (w.hw_proto, w.fw_version) == (2, "1.2.0")
         else:
             assert (w.hw_proto, w.fw_version) == (1, "")
 
-        # 2. Повна синхронізація після підключення: 12 кнопок x 3 слоти + 3 енкодери x 2
-        n_set = lambda: sum(1 for r in sim.rx if r.startswith("SET_KEY:"))
-        assert wait_until(qapp, lambda: n_set() >= 42), sim.rx
-        assert n_set() == 42
-        assert "SET_KEY:BTN_1:TAP:HID_MEDIA:3" in sim.rx      # Мультимедіа: BTN_1 = MED:PREV
-        assert "SET_KEY:BTN_7:TAP:SERIAL" in sim.rx           # MED:MIC_MUTE — тільки ПК
+        # 2. Після підключення: у флеш плати записано профіль "без програми", а в пам'ять — активний
+        assert wait_until(qapp, lambda: "SAVE_EEPROM" in sim.rx and board_state(sim.rx)[0] == w.compute_hw_specs()), sim.rx
+        ram, saved = board_state(sim.rx)
+        assert len(ram) == 42                                   # 12 кнопок x 3 слоти + 3 енкодери x 2
+        assert saved == w.compute_standalone_specs()
+        assert ram["BTN_1:TAP"] == "HID_MEDIA:3"                # Медіа: BTN_1 = попередній трек
+        assert ram["BTN_5:TAP"] == "SERIAL"                     # мут мікрофона — лише через програму
+        assert saved["BTN_5:TAP"] == "NONE"                     # ...тому без програми кнопка порожня
+        assert saved["ENC_3_SW:TAP"] == "HID_MEDIA:4"           # а мут звуку плата вміє сама
+        assert ram["ENC_3_SW:TAP"] == "SERIAL"                  # (з програмою — ще й утримання = профіль)
 
         # 3. Апаратна кнопка: виконує плата, ПК не дублює
         sim._ctl(f"#press {PIN_BTN1}"); pump(qapp, 80); sim._ctl(f"#release {PIN_BTN1}")
@@ -185,40 +209,54 @@ def test_e2e_sync_and_no_double_execution(qapp, monkeypatch, firmware):
         pump(qapp, 150)
         assert injected == []
 
-        # 4. SERIAL-кнопка: виконує ПК, плата не шле HID
+        # 4. Кнопка, якій потрібна програма: виконує ПК, плата не шле HID
         hid_before = len(sim.hid)
-        sim._ctl(f"#press {PIN_BTN7}"); pump(qapp, 80); sim._ctl(f"#release {PIN_BTN7}")
+        sim._ctl(f"#press {PIN_BTN5}"); pump(qapp, 80); sim._ctl(f"#release {PIN_BTN5}")
         assert wait_until(qapp, lambda: ("mic_mute",) in injected)
         assert len(sim.hid) == hid_before
 
-        # 5. Перемикання профілю: відправляються лише змінені рядки
+        # 5. Перемикання профілю: лише змінені рядки і без запису у флеш
+        saves = sim.rx.count("SAVE_EEPROM")
         before = n_set()
-        w.switch_profile(1)  # Blender 3D
-        assert wait_until(qapp, lambda: "SET_KEY:BTN_4:TAP:HID_KEY:0:103" in sim.rx)
+        w.switch_profile(2)  # Офіс і браузер
+        assert wait_until(qapp, lambda: board_state(sim.rx)[0] == w.compute_hw_specs())
         pump(qapp, 100)
-        delta = n_set() - before
-        assert 0 < delta < 42, delta
+        assert 0 < n_set() - before < 42
+        assert sim.rx.count("SAVE_EEPROM") == saves
 
-        # 6. Multi-tap на платі (tap=g, dtap=r, hold=s) — одинарний тап після вікна 2x
+        # 6. Tap/Hold на платі: ENC_2_SW натискання = нова вкладка (Ctrl+T)
         injected.clear()
-        sim._ctl(f"#press {PIN_BTN4}"); pump(qapp, 60); sim._ctl(f"#release {PIN_BTN4}")
-        assert wait_until(qapp, lambda: "+103" in sim.hid)
+        sim._ctl(f"#press {PIN_ENC2_SW}"); pump(qapp, 60); sim._ctl(f"#release {PIN_ENC2_SW}")
+        assert wait_until(qapp, lambda: "+116" in sim.hid and "+128" in sim.hid)
         pump(qapp, 100)
         assert injected == []
 
-        # 7. Енкодер: Blender ENC_1 = ENC:ZOOM -> плата шле Ctrl+'='
-        sim._ctl("#enc 0 1")
-        assert wait_until(qapp, lambda: "+61" in sim.hid)
+        # 7. Енкодер: ENC_2 праворуч = наступна вкладка (Ctrl+Tab)
+        sim._ctl("#enc 1 1")
+        assert wait_until(qapp, lambda: "+179" in sim.hid)
         pump(qapp, 100)
         assert injected == []
 
-        # 8. Зміни під час відключення не губляться: SAVE_EEPROM дійде після підключення
+        # 8. Інший профіль "без програми" (NumPad): записується у флеш, активний лишається
+        w.set_standalone_profile(1)
+        assert wait_until(qapp, lambda: sim.rx.count("SAVE_EEPROM") == saves + 1
+                          and board_state(sim.rx)[0] == w.compute_hw_specs())
+        ram, saved = board_state(sim.rx)
+        assert saved == w.compute_standalone_specs()
+        assert saved["BTN_1:TAP"] == "HID_KEY:0:231"           # num 7
+        assert ram["BTN_1:TAP"] == "HID_KEY:1:99"              # активний профіль: Ctrl+C
+
+        # 9. Вихід з програми: плата переходить на профіль "без програми", як після перепідключення
+        w.restore_board_standalone()
+        assert wait_until(qapp, lambda: board_state(sim.rx)[0] == w.compute_standalone_specs())
+        hid_before = len(sim.hid)
+        sim._ctl(f"#press {PIN_BTN1}"); pump(qapp, 80); sim._ctl(f"#release {PIN_BTN1}")
+        assert wait_until(qapp, lambda: "+231" in sim.hid[hid_before:])
+
+        # 10. Плата зникла — програма це бачить
         proc.stdin.close()
         proc.wait(timeout=3)
         assert wait_until(qapp, lambda: not w.device_connected, 4.0)
-        w.sync_hardware_bindings(save_eeprom=True)
-        pump(qapp, 100)
-        assert w._hw_save_pending is True
     finally:
         w.cleanup_threads()
         if proc.poll() is None:

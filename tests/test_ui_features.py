@@ -13,7 +13,7 @@ from conftest import process_events_for
 
 
 @pytest.fixture
-def window(qapp, monkeypatch):
+def window(qapp, monkeypatch, fresh_config):
     monkeypatch.setattr(th.serial.tools.list_ports, "comports", lambda: [])
     monkeypatch.setattr(updater, "get_latest_release_data", lambda: {})
     import main_window
@@ -30,7 +30,8 @@ def test_duplicate_profile(window):
     w = window
     profiles = w.config["PROFILES"]
     n = len(profiles)
-    src = profiles[2]                       # "Photoshop" з прив'язкою до photoshop.exe
+    src = profiles[2]
+    src["app_bind"] = "chrome.exe"
     w.duplicate_profile(2)
     assert len(profiles) == n + 1
     copy_ = profiles[-1]
@@ -49,8 +50,8 @@ def test_tray_profile_menu(window):
     acts = w.tray_profiles_menu.actions()
     assert len(acts) == len(w.config["PROFILES"])
     assert [a.isChecked() for a in acts].index(True) == 1
-    acts[3].trigger()
-    assert w.active_profile_idx == 3
+    acts[2].trigger()
+    assert w.active_profile_idx == 2
 
 
 def test_first_close_explains_tray_once(window, qapp):
@@ -181,3 +182,27 @@ def test_bundled_firmware_passes_check():
     for f in files:
         ok, info = updater.inspect_uf2(f)
         assert ok is True, (f, info)
+
+
+def test_settings_standalone_profile_and_defaults(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    from widgets import SettingsDialog
+    w = window
+    SettingsDialog.check_autostart = lambda self: False
+    d = SettingsDialog(w)
+    assert d.combo_standalone.count() == len(w.config["PROFILES"])
+    assert d.combo_standalone.currentIndex() == 0
+    d.combo_standalone.setCurrentIndex(1)
+    assert w.standalone_profile_index() == 1 and w.config["standalone_profile"] == 1
+
+    # видалення профілю зсуває номер профілю "без програми"
+    w.delete_profile(0)
+    assert w.standalone_profile_index() == 0
+    assert w.config["PROFILES"][0]["name"] == "NumPad"
+
+    # відновлення стандартних профілів
+    w.config["PROFILES"][0]["name"] = "Мій"
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    d.restore_defaults()
+    assert [p["name"] for p in w.config["PROFILES"]] == ["Медіа", "NumPad", "Офіс і браузер"]
+    assert w.active_profile_idx == 0 and w.standalone_profile_index() == 0

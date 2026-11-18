@@ -2765,7 +2765,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Налаштування")
-        self.setFixedSize(400, 400)
+        self.setFixedSize(420, 500)
         self.setStyleSheet(f"background-color: {BG_MAIN}; color: {TEXT_MAIN};")
 
         layout = QVBoxLayout(self)
@@ -2847,6 +2847,21 @@ class SettingsDialog(QDialog):
         self.btn_flash.clicked.connect(self.flash_board)
         layout.addWidget(self.btn_flash)
 
+        lbl_sa = QLabel("Профіль, що працює без програми (зберігається в макропаді):")
+        lbl_sa.setStyleSheet(f"color: {TEXT_MAIN}; font-size: 12px;")
+        lbl_sa.setWordWrap(True)
+        layout.addWidget(lbl_sa)
+        self.combo_standalone = QComboBox()
+        self.combo_standalone.setStyleSheet(f"QComboBox {{ background: #111; color: #fff; border: 1px solid #333; border-radius: 5px; padding: 6px 8px; font-size: 13px; }} QComboBox:hover {{ border: 1px solid {ACCENT}; }}")
+        for i, prof in enumerate(main.config.get("PROFILES", [])):
+            self.combo_standalone.addItem(f"{i + 1}. {prof.get('name', 'Профіль')}", i)
+        self.combo_standalone.setCurrentIndex(main.standalone_profile_index())
+        self.combo_standalone.currentIndexChanged.connect(
+            lambda _: main.set_standalone_profile(self.combo_standalone.currentData()))
+        self.combo_standalone.setToolTip("Дії, яким потрібна програма (макроси, мут мікрофона, профілі),\n"
+                                         "без неї не працюють — решта виконується самою платою.")
+        layout.addWidget(self.combo_standalone)
+
         # --- Поточний профіль
         profiles = main.config.get("PROFILES", [])
         prof_name = profiles[main.active_profile_idx].get("name", "") if 0 <= main.active_profile_idx < len(profiles) else ""
@@ -2862,6 +2877,14 @@ class SettingsDialog(QDialog):
         self.btn_reset.clicked.connect(self.reset_profile)
         layout.addWidget(self.btn_reset)
 
+        self.btn_defaults = QPushButton("Відновити стандартні профілі…")
+        self.btn_defaults.setIcon(icons.icon("refresh", ICON_COLOR))
+        self.btn_defaults.setIconSize(QSize(16, 16))
+        self.btn_defaults.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_defaults.setStyleSheet(plain_btn_style.replace(f"border: 1px solid {ACCENT}", f"border: 1px solid {BTN_DANGER}"))
+        self.btn_defaults.clicked.connect(self.restore_defaults)
+        layout.addWidget(self.btn_defaults)
+
         layout.addStretch()
 
         btn_close = QPushButton("Закрити")
@@ -2869,6 +2892,19 @@ class SettingsDialog(QDialog):
         btn_close.clicked.connect(self.accept)
         btn_close.setStyleSheet(f"QPushButton {{ background-color: {BG_HOVER}; border: 1px solid #333; padding: 8px; border-radius: 5px; font-weight: bold; }} QPushButton:hover {{ border: 1px solid {ACCENT}; }}")
         layout.addWidget(btn_close)
+
+    def restore_defaults(self):
+        from PySide6.QtWidgets import QMessageBox
+        main = self.parent()
+        answer = QMessageBox.question(
+            self, "Стандартні профілі",
+            "Замінити всі профілі стандартними: «Медіа», «NumPad», «Офіс і браузер»?\n\n"
+            "Ваші поточні профілі буде видалено. Макроси, групи запуску та збережені\n"
+            "програми залишаться. Порада: спершу експортуйте потрібні профілі.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes:
+            main.restore_default_profiles()
+            self.accept()
 
     def reset_profile(self):
         main = self.parent()

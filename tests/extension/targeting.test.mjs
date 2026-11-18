@@ -95,3 +95,15 @@ test('YouTube Music у фоні звучить — керуємо ним', () =>
   const tabs = [tab(1, W + 'a', { active: true }), tab(2, 'https://music.youtube.com/', { audible: true })];
   assert.equal(rankTargets(tabs, { focusedWindowId: 1 })[0].id, 2);
 });
+
+test('manifest відповідає вимогам Chrome Web Store', async () => {
+  const fs = await import('node:fs');
+  const m = JSON.parse(fs.readFileSync(new URL('../../extension/manifest.json', import.meta.url), 'utf8'));
+  assert.equal(m.manifest_version, 3);
+  assert.ok(m.description.length <= 132, 'description ≤ 132 символи');
+  assert.ok(m.name.length <= 75, 'name ≤ 75 символів');
+  assert.ok(/^\d+(\.\d+){0,3}$/.test(m.version), 'версія — до 4 чисел через крапку');
+  assert.ok(m.icons['128'], 'потрібна іконка 128x128');
+  // жодних широких дозволів — лише YouTube
+  for (const h of m.host_permissions) assert.match(h, /^https:\/\/(www|m|music)\.youtube\.com\/\*$/);
+});
