@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <title>VPT Pad — YouTube Control</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <span class="logo">VPT | Pad</span>
+    <span id="status" class="status off"><i></i><span id="status-text">Перевірка…</span></span>
+  </header>
+
+  <p id="hint" class="hint" hidden></p>
+
+  <section>
+    <h2>Якою вкладкою керувати</h2>
+    <div id="tabs" class="tabs"></div>
+  </section>
+
+  <footer>
+    <button id="test" type="button">Перевірити: Play / Pause</button>
+    <span id="result" class="result"></span>
+  </footer>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>
