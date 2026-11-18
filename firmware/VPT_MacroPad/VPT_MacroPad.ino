@@ -8,6 +8,7 @@
 //     SET_KEY:ENC_x_SW:[TAP|DTAP|HOLD]:<spec>
 //     SET_KEY:ENC_x_L:<spec> / SET_KEY:ENC_x_R:<spec>
 //     SAVE_EEPROM                      -> EEPROM_SAVED
+//     LOAD_EEPROM                      (повернутись до збереженого профілю "без програми")
 //     RESET_HW, ENTER_BOOTLOADER
 //     <spec> = NONE | SERIAL | HID_KEY:<mods>:<key> | HID_MOUSE:<n> | HID_MEDIA:<n>
 //   плата -> ПК:
@@ -20,6 +21,11 @@
 //     Події енкодера несуть множник прискорення ":A<1..5>", виміряний на платі за
 //     інтервалом між клацаннями (ПК не бачить реальних інтервалів — USB доставляє пачками).
 //     Якщо плата перезапустилась через watchdog, у PROTO_OK додається ":RST=WDT".
+//
+//   Робота без програми: у флеші (EEPROM) зберігається профіль для автономної роботи.
+//   Програма пише його туди при підключенні, а в оперативну пам'ять — активний профіль.
+//   Коли програма закриває порт (або зникає), плата сама повертається до профілю з флешу,
+//   тож поведінка після закриття програми й після перепідключення кабелю однакова.
 
 #include <Arduino.h>
 #ifdef USB
@@ -33,7 +39,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
 const uint8_t PROTO_MAX = 2;
 
 const int NUM_BTNS = 12;  // 0..8 = BTN_1..9, 9..11 = ENC_1_SW..ENC_3_SW
@@ -201,25 +207,47 @@ uint16_t getMediaUsageCode(uint8_t mediaId) {
   }
 }
 
+// Вбудований профіль "Медіа" — макропад працює одразу з коробки, ще до встановлення програми.
+// Це той самий профіль 1 програми в режимі "без ПК": дії, яким потрібна програма
+// (мут мікрофона, перемикання профілів), тут порожні. Тест tests/test_profiles.py
+// перевіряє, що таблиця збігається з профілем програми.
+const char *const DEFAULT_BUTTON_SPECS[NUM_BTNS][3] = {
+  {"HID_MEDIA:3", "NONE", "NONE"},       // BTN_1    Попередній трек
+  {"HID_MEDIA:1", "NONE", "NONE"},       // BTN_2    Play / Pause
+  {"HID_MEDIA:2", "NONE", "NONE"},       // BTN_3    Наступний трек
+  {"HID_KEY:8:101", "NONE", "NONE"},     // BTN_4    Провідник (Win+E)
+  {"NONE", "NONE", "NONE"},              // BTN_5    Мут мікрофона — лише з програмою
+  {"HID_KEY:10:115", "NONE", "NONE"},    // BTN_6    Скріншот (Win+Shift+S)
+  {"HID_KEY:8:100", "NONE", "NONE"},     // BTN_7    Згорнути вікна (Win+D)
+  {"HID_KEY:3:177", "NONE", "NONE"},     // BTN_8    Диспетчер завдань (Ctrl+Shift+Esc)
+  {"HID_KEY:8:108", "NONE", "NONE"},     // BTN_9    Блокування ПК (Win+L)
+  {"HID_MOUSE:3", "NONE", "NONE"},       // ENC_1_SW Середня кнопка миші
+  {"HID_KEY:1:48", "NONE", "NONE"},      // ENC_2_SW Масштаб 100% (Ctrl+0)
+  {"HID_MEDIA:4", "NONE", "NONE"},       // ENC_3_SW Вимкнути звук (утримання = профіль, з програмою)
+};
+const char *const DEFAULT_ENCODER_SPECS[NUM_ENC][2] = {
+  {"HID_MOUSE:4", "HID_MOUSE:5"},        // ENC_1 прокрутка
+  {"HID_KEY:1:45", "HID_KEY:1:61"},      // ENC_2 масштаб (Ctrl- / Ctrl=)
+  {"HID_MEDIA:6", "HID_MEDIA:5"},        // ENC_3 гучність
+};
+
+HidBinding parseBindingSpec(const char *spec);
+
 void resetDefaultConfig() {
   memset(&hwConfig, 0, sizeof(hwConfig));
   hwConfig.magic = EEPROM_MAGIC;
-  for (int b = 0; b < NUM_BTNS; b++) {
-    hwConfig.buttons[b][SLOT_TAP]  = {ACT_SERIAL, 0, 0, 0};
-    hwConfig.buttons[b][SLOT_DTAP] = {ACT_NONE, 0, 0, 0};
-    hwConfig.buttons[b][SLOT_HOLD] = {ACT_NONE, 0, 0, 0};
-  }
-  for (int e = 0; e < NUM_ENC; e++) {
-    hwConfig.encoders[e][0] = {ACT_SERIAL, 0, 0, 0};
-    hwConfig.encoders[e][1] = {ACT_SERIAL, 0, 0, 0};
-  }
+  for (int b = 0; b < NUM_BTNS; b++)
+    for (int sl = 0; sl < 3; sl++) hwConfig.buttons[b][sl] = parseBindingSpec(DEFAULT_BUTTON_SPECS[b][sl]);
+  for (int e = 0; e < NUM_ENC; e++)
+    for (int d = 0; d < 2; d++) hwConfig.encoders[e][d] = parseBindingSpec(DEFAULT_ENCODER_SPECS[e][d]);
 }
 
 static bool isValidBinding(const HidBinding &b) {
   return b.type <= ACT_HID_MEDIA;
 }
 
-void loadEEPROMConfig() {
+// Читає профіль "без програми" з флешу. persistDefaults=false — лише в оперативну пам'ять.
+void loadEEPROMConfig(bool persistDefaults) {
   EEPROM.get(0, hwConfig);
   bool valid = (hwConfig.magic == EEPROM_MAGIC);
   for (int b = 0; valid && b < NUM_BTNS; b++)
@@ -229,8 +257,10 @@ void loadEEPROMConfig() {
 
   if (!valid) {
     resetDefaultConfig();
-    EEPROM.put(0, hwConfig);
-    EEPROM.commit();
+    if (persistDefaults) {
+      EEPROM.put(0, hwConfig);
+      EEPROM.commit();
+    }
   }
 }
 
@@ -451,6 +481,8 @@ void processSerialCommand(char *cmd) {
   } else if (strcmp(cmd, "SAVE_EEPROM") == 0) {
     saveEEPROMConfig();
     Serial.println("EEPROM_SAVED");
+  } else if (strcmp(cmd, "LOAD_EEPROM") == 0) {
+    loadEEPROMConfig(false);
   } else if (strcmp(cmd, "RESET_HW") == 0) {
     resetDefaultConfig();
     saveEEPROMConfig();
@@ -460,9 +492,14 @@ void processSerialCommand(char *cmd) {
 }
 
 void pollSerialInput() {
-  // При закритті порту ПК повертаємось до протоколу v1 (сумісність зі старими версіями програми)
+  // Програма закрила порт (вихід, збій, сон ПК): повертаємось до протоколу v1 (сумісність
+  // зі старими версіями програми) і до профілю "без програми" з флешу — інакше в пам'яті
+  // лишалися прив'язки, яким потрібна програма, і частина кнопок "мовчала".
   bool hostOpen = (bool)Serial;
-  if (hostWasOpen && !hostOpen) protoLevel = 1;
+  if (hostWasOpen && !hostOpen) {
+    protoLevel = 1;
+    loadEEPROMConfig(false);
+  }
   hostWasOpen = hostOpen;
 
   int budget = 512; // не блокуємо цикл надовго навіть при великому пакеті команд
@@ -632,7 +669,7 @@ void setup() {
   USB.setManufacturer("VPT Tech");
   USB.setProduct("VPT MacroPad");
   EEPROM.begin(512);
-  loadEEPROMConfig();
+  loadEEPROMConfig(true);
   Keyboard.begin();
   Mouse.begin();
   USB.connect();

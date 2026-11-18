@@ -84,10 +84,58 @@ static void test_default_serial_events() {
   CHECK(has_line("BTN_1_PRESSED"));
   release(PIN_BTN1);
   CHECK(has_line("BTN_1_RELEASED"));
-  CHECK(Keyboard.log.empty());
   press(PIN_ENC1_SW, 40); release(PIN_ENC1_SW);
   CHECK(has_line("ENC_1_SW_PRESSED"));
   CHECK(has_line("ENC_1_SW_RELEASED"));
+}
+
+// Нова плата (порожній флеш) працює одразу, без програми: вбудований профіль "Медіа"
+static void test_works_out_of_the_box() {
+  boot();
+  Serial.host_open = false;   // програми немає
+  run_ms(5);
+  clear_io();
+  press(PIN_BTN1, 40); release(PIN_BTN1);
+  CHECK(count_log(Keyboard.log, "+c182") == 1);          // попередній трек
+  press(PIN_BTN2, 40); release(PIN_BTN2);
+  CHECK(count_log(Keyboard.log, "+c205") == 1);          // play / pause
+  enc_click(2, +1); run_ms(20);
+  CHECK(count_log(Keyboard.log, "+c233") == 1);          // ENC_3 — гучність +
+  enc_click(0, -1); run_ms(20);
+  CHECK(count_log(Mouse.log, "w1") == 1);                // ENC_1 — прокрутка
+  CHECK(Keyboard.down.empty() && Keyboard.consumer == 0);
+  // Таблиця вбудованого профілю повністю валідна (жодних SERIAL-заглушок)
+  for (int b = 0; b < NUM_BTNS; b++)
+    for (int sl = 0; sl < 3; sl++) CHECK(hwConfig.buttons[b][sl].type != ACT_SERIAL);
+  for (int e = 0; e < NUM_ENC; e++)
+    for (int d = 0; d < 2; d++) CHECK(isHidType(hwConfig.encoders[e][d].type));
+}
+
+// Програма закрила порт — плата повертається до профілю з флешу (як після перепідключення)
+static void test_reverts_to_saved_profile_when_app_closes() {
+  boot();
+  cmd("SET_KEY:BTN_1:TAP:HID_KEY:0:120");   // профіль "без програми": 'x'
+  cmd("SAVE_EEPROM");
+  cmd("SET_KEY:BTN_1:TAP:SERIAL");           // активний профіль програми: подію обробляє ПК
+  clear_io();
+  press(PIN_BTN1, 40); release(PIN_BTN1);
+  CHECK(count_log(Keyboard.log, "+120") == 0);
+  Serial.host_open = false;                  // програму закрили
+  run_ms(3);
+  clear_io();
+  press(PIN_BTN1, 40); release(PIN_BTN1);
+  CHECK(count_log(Keyboard.log, "+120") == 1);
+  CHECK(hwConfig.buttons[0][SLOT_TAP].type == ACT_HID_KEY);
+  // повернення не стирає флеш
+  int commits = EEPROM.commits;
+  Serial.host_open = true; run_ms(3); Serial.host_open = false; run_ms(3);
+  CHECK(EEPROM.commits == commits);
+
+  // те саме явною командою (програма шле її перед виходом)
+  Serial.host_open = true; run_ms(3);
+  cmd("SET_KEY:BTN_1:TAP:SERIAL");
+  cmd("LOAD_EEPROM");
+  CHECK(hwConfig.buttons[0][SLOT_TAP].type == ACT_HID_KEY && hwConfig.buttons[0][SLOT_TAP].param2 == 120);
 }
 
 static void test_ping_and_proto() {
@@ -243,7 +291,7 @@ static void test_serial_robustness() {
   Serial.feed(junk + "SET_KEY:BTN_1:TAP:HID_KEY:0:97\nPING_VPT_MACROPAD\n");
   run_ms(5);
   CHECK(has_line("PONG_VPT_MACROPAD_V1"));
-  CHECK(hwConfig.buttons[0][SLOT_TAP].type == ACT_SERIAL);
+  CHECK(hwConfig.buttons[0][SLOT_TAP].type == ACT_HID_MEDIA);   // вбудований профіль не змінився
 
   // Пошкоджені специфікації -> SERIAL (подія піде на ПК)
   cmd("SET_KEY:BTN_1:TAP:HID_KEY:99:999");
@@ -273,11 +321,11 @@ static void test_eeprom_persistence() {
   CHECK(hwConfig.buttons[2][SLOT_TAP].type == ACT_HID_MEDIA);
   CHECK(hwConfig.buttons[2][SLOT_TAP].param1 == 1);
 
-  // Пошкоджений вміст EEPROM -> дефолти
+  // Пошкоджений вміст EEPROM -> вбудований профіль
   EEPROM.flash[4] = 77;
   boot(true);
-  CHECK(hwConfig.buttons[0][SLOT_TAP].type == ACT_SERIAL);
-  CHECK(hwConfig.buttons[2][SLOT_TAP].type == ACT_SERIAL);
+  CHECK(hwConfig.buttons[0][SLOT_TAP].type == ACT_HID_MEDIA && hwConfig.buttons[0][SLOT_TAP].param1 == 3);
+  CHECK(hwConfig.buttons[2][SLOT_TAP].type == ACT_HID_MEDIA && hwConfig.buttons[2][SLOT_TAP].param1 == 2);
 }
 
 static void test_bootloader_releases_keys() {
@@ -322,6 +370,8 @@ static void test_watchdog() {
 static void test_encoder_accel_measured_on_board() {
   boot();
   cmd("PROTO:2");
+  cmd("SET_KEY:ENC_1_L:SERIAL");
+  cmd("SET_KEY:ENC_1_R:SERIAL");
   // Пауза gap_ms ПЕРЕД кожним клацанням: інтервал кожного клацання = gap_ms (+1 мс циклу)
   auto rotate = [](int dir, int n, int gap_ms) {
     for (int i = 0; i < n; i++) { run_ms(gap_ms); enc_click(0, dir); }
@@ -386,6 +436,8 @@ static void test_fast_debounce() {
 
 int main() {
   test_default_serial_events();
+  test_works_out_of_the_box();
+  test_reverts_to_saved_profile_when_app_closes();
   test_ping_and_proto();
   test_fast_path_hid();
   test_no_stuck_key_on_rebind();
