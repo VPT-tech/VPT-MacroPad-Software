@@ -47,8 +47,70 @@ FRIENDLY_NAMES = {
     "CMD:start spotify:": "Spotify",
     "EXT:YT_FWD": "Ютуб: Вперед",
     "EXT:YT_BACK": "Ютуб: Назад",
-    "EXT:YT_PLAYPAUSE": "Ютуб: Play / Pause"
+    "EXT:YT_PLAYPAUSE": "Ютуб: Play / Pause",
+    "EXT:YT_NEXT": "Ютуб: Наступне відео",
+    "EXT:YT_PREV": "Ютуб: Попереднє відео",
+    "EXT:YT_RESTART": "Ютуб: На початок",
+    "EXT:YT_VOL_UP": "Ютуб: Гучність +",
+    "EXT:YT_VOL_DOWN": "Ютуб: Гучність −",
+    "EXT:YT_MUTE": "Ютуб: Звук вкл / викл",
+    "EXT:YT_SPEED_UP": "Ютуб: Швидкість +",
+    "EXT:YT_SPEED_DOWN": "Ютуб: Швидкість −",
+    "EXT:YT_SPEED_RESET": "Ютуб: Швидкість 1×",
+    "EXT:YT_CAPTIONS": "Ютуб: Субтитри",
+    "EXT:YT_THEATER": "Ютуб: Режим кінотеатру",
+    "EXT:YT_LIKE": "Ютуб: Лайк",
+    "ENC:YT_SEEK": "Ютуб: Перемотка",
+    "ENC:YT_VOL": "Ютуб: Гучність плеєра",
+    "ENC:YT_SPEED": "Ютуб: Швидкість"
 }
+
+# Дії YouTube для кнопок: значення дії -> команда розширенню браузера (WebSocket).
+# YT_PLAYPAUSE / YT_FWD:n / YT_BACK:n розуміє і старе розширення; решта — розширення 2.0+.
+YT_BUTTON_COMMANDS = {
+    "EXT:YT_PLAYPAUSE": "YT_PLAYPAUSE",
+    "EXT:YT_NEXT": "YT_NEXT",
+    "EXT:YT_PREV": "YT_PREV",
+    "EXT:YT_RESTART": "YT_RESTART",
+    "EXT:YT_VOL_UP": "YT_VOL:5",
+    "EXT:YT_VOL_DOWN": "YT_VOL:-5",
+    "EXT:YT_MUTE": "YT_MUTE",
+    "EXT:YT_SPEED_UP": "YT_SPEED:0.25",
+    "EXT:YT_SPEED_DOWN": "YT_SPEED:-0.25",
+    "EXT:YT_SPEED_RESET": "YT_SPEED:=1",
+    "EXT:YT_CAPTIONS": "YT_CAPTIONS",
+    "EXT:YT_THEATER": "YT_THEATER",
+    "EXT:YT_LIKE": "YT_LIKE",
+}
+YT_ENCODER_ACTIONS = ("ENC:YT_SEEK", "ENC:YT_VOL", "ENC:YT_SPEED")
+
+
+def yt_command_for_action(act):
+    """Команда розширенню для дії кнопки (EXT:YT_...) або None."""
+    if act in YT_BUTTON_COMMANDS:
+        return YT_BUTTON_COMMANDS[act]
+    for prefix, cmd in (("EXT:YT_FWD", "YT_FWD"), ("EXT:YT_BACK", "YT_BACK")):
+        if act == prefix or act.startswith(prefix + ":"):
+            arg = act[len(prefix) + 1:]
+            try:
+                secs = max(1, min(600, int(float(arg)))) if arg else 10
+            except ValueError:
+                secs = 10
+            return f"{cmd}:{secs}"
+    return None
+
+
+def yt_command_for_rotation(act, is_right, accel=1):
+    """Команда розширенню для обертання енкодера (ENC:YT_...) або None."""
+    accel = max(1, min(5, int(accel)))
+    if act == "ENC:YT_SEEK":
+        return f"{'YT_FWD' if is_right else 'YT_BACK'}:{5 * accel}"
+    if act == "ENC:YT_VOL":
+        step = min(15, 5 * accel)
+        return f"YT_VOL:{step if is_right else -step}"
+    if act == "ENC:YT_SPEED":
+        return f"YT_SPEED:{'0.25' if is_right else '-0.25'}"
+    return None
 
 VK_MAP = {
     'a': 0x41, 'b': 0x42, 'c': 0x43, 'd': 0x44, 'e': 0x45, 'f': 0x46, 'g': 0x47, 'h': 0x48,

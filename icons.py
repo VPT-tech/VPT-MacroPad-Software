@@ -2,6 +2,10 @@
 # Набір іконок assets/icons/*.svg (лінійні, 24x24, stroke="currentColor").
 # currentColor підміняється потрібним кольором під час рендеру, тож одна іконка
 # може бути сірою, акцентною (бірюзовою) чи червоною залежно від стану.
+#
+# Іконки використовуються лише там, де вони несуть інформацію або заміняють текст:
+# кнопки-інструменти (видалити, оновити, налаштування), меню, перемикач режиму
+# натискання та OSD. У списках дій іконок навмисно немає — щоб не перевантажувати вікно.
 import os
 
 from PySide6.QtCore import Qt, QByteArray, QRectF
@@ -97,79 +101,3 @@ def icon(name, color=ICON_COLOR, active=None, disabled=ICON_DISABLED):
                 ic.addPixmap(pixmap(name, size, disabled), QIcon.Mode.Disabled, QIcon.State.Off)
     _icon_cache[key] = ic
     return ic
-
-
-# ----------------------------------------------------------------- дія -> іконка
-_EXACT = {
-    "SYS:PROFILE_NEXT": "profile-next",
-    "SYS:PROFILE_PREV": "profile-prev",
-    "ENC:MODE_TOGGLE": "dial",
-    "ENC:VOL": "volume",
-    "ENC:BRIGHTNESS": "brightness",
-    "ENC:SCROLL": "scroll",
-    "ENC:ZOOM": "zoom",
-    "ENC:TIMELINE": "timeline",
-    "ENC:BRUSH": "brush",
-    "ENC:UNDO_REDO": "history",
-    "SYS:TASK": "activity",
-    "SYS:DESKTOP": "desktop",
-    "SYS:SNIP": "screenshot",
-    "SYS:LOCK": "lock",
-    "SYS:SLEEP": "sleep",
-    "MED:PLAY": "play-pause",
-    "MED:NEXT": "next",
-    "MED:PREV": "prev",
-    "MED:VOL_UP": "volume-up",
-    "MED:VOL_DOWN": "volume-down",
-    "MED:MUTE": "volume-x",
-    "MED:MIC_MUTE": "mic-off",
-    "EXT:YT_PLAYPAUSE": "youtube",
-    "CMD:start spotify:": "music",
-}
-_PREFIX = (
-    ("SYS:PROFILE_GOTO:", "profile-goto"),
-    ("SYS:PROFILE_HOLD:", "layers"),
-    ("EXT:YT_BACK", "rewind"),
-    ("EXT:YT_FWD", "forward"),
-    ("ENC:APP:", "mixer"),
-    ("APP_MUTE:", "volume-x"),
-    ("TEXT:", "type"),
-    ("URL:", "globe"),
-    ("EXE:", "app"),
-    ("MULTI:", "launch"),
-    ("MACRO:", "macro"),
-    ("CMD:", "terminal"),
-)
-_HOTKEYS = {
-    "ctrl+c": "copy",
-    "ctrl+v": "paste",
-    "ctrl+x": "cut",
-    "ctrl+z": "undo",
-    "ctrl+a": "select-all",
-    "ctrl+s": "save",
-    "alt+f4": "window-close",
-}
-
-
-def action_icon_name(val):
-    """Назва іконки для дії (рядка призначення) або None."""
-    if not val or val == "NONE":
-        return None
-    if val in _EXACT:
-        return _EXACT[val]
-    for prefix, name in _PREFIX:
-        if val.startswith(prefix):
-            return name
-    if val.startswith("HOTKEY:"):
-        combo = val.split(":", 1)[1].strip().lower()
-        if combo in _HOTKEYS:
-            return _HOTKEYS[combo]
-        if combo.startswith("mouse_"):
-            return "mouse"
-        return "keyboard"
-    return None
-
-
-def action_icon(val, color=ICON_COLOR, active=None):
-    name = action_icon_name(val)
-    return icon(name, color, active) if name else QIcon()

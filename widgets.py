@@ -127,6 +127,7 @@ class ProfileWidget(QFrame):
         menu = QMenu(self)
         a_bind = QAction(icons.icon("link", ICON_COLOR), "Прив'язати до .exe", self)
         a_ren = QAction(icons.icon("rename", ICON_COLOR), "Перейменувати", self)
+        a_dup = QAction(icons.icon("copy", ICON_COLOR), "Дублювати профіль", self)
         a_exp = QAction(icons.icon("export", ICON_COLOR), "Експорт профілю (.json)", self)
         a_imp = QAction(icons.icon("import", ICON_COLOR), "Імпорт профілю (.json)", self)
 
@@ -142,6 +143,7 @@ class ProfileWidget(QFrame):
 
         menu.addAction(a_bind)
         menu.addAction(a_ren)
+        menu.addAction(a_dup)
         menu.addSeparator()
         menu.addAction(a_exp)
         menu.addAction(a_imp)
@@ -160,6 +162,8 @@ class ProfileWidget(QFrame):
             self.rename_profile()
         elif action == a_bind:
             self.bind_app()
+        elif action == a_dup and hasattr(self.main_app, 'duplicate_profile'):
+            self.main_app.duplicate_profile(self.index)
         elif action == a_exp and hasattr(self.main_app, 'export_profile'):
             self.main_app.export_profile(self.index)
         elif action == a_imp and hasattr(self.main_app, 'import_profile'):
@@ -329,6 +333,7 @@ class OSDOverlay(QWidget):
         self.hide_timer.timeout.connect(self.fade_out)
 
         self.anim = QPropertyAnimation(self, b"windowOpacity")
+        self._hide_connected = False
         self.anim.setDuration(180)
         self.anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
@@ -349,10 +354,7 @@ class OSDOverlay(QWidget):
             self.move(geo.right() - self.width() - 28, geo.top() + 28)
 
         self.anim.stop()
-        try:
-            self.anim.finished.disconnect(self.hide)
-        except Exception:
-            pass
+        self._disconnect_hide()
 
         self.update()
         if not self.isVisible():
@@ -363,15 +365,19 @@ class OSDOverlay(QWidget):
         self.anim.start()
         self.hide_timer.start(1500)
 
+    def _disconnect_hide(self):
+        # Відключаємо лише якщо підключали — інакше PySide пише попередження в лог
+        if self._hide_connected:
+            self.anim.finished.disconnect(self.hide)
+            self._hide_connected = False
+
     def fade_out(self):
         self.anim.stop()
-        try:
-            self.anim.finished.disconnect(self.hide)
-        except Exception:
-            pass
+        self._disconnect_hide()
         self.anim.setStartValue(self.windowOpacity())
         self.anim.setEndValue(0.0)
         self.anim.finished.connect(self.hide)
+        self._hide_connected = True
         self.anim.start()
 
     def paintEvent(self, event):
@@ -404,16 +410,19 @@ class OSDOverlay(QWidget):
             p.setFont(QFont("Segoe UI Emoji", 16))
             p.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, self.icon_text)
 
-        if self.mode == "volume":
-            # Заголовок + відсотки
+        if self.mode in ("volume", "progress"):
+            # Заголовок + відсотки ("progress" — без відсотків, напр. позиція у відео)
             p.setFont(QFont("Arial", 10, QFont.Weight.Bold))
             p.setPen(QColor("#ffffff"))
-            p.drawText(QRectF(68, 15, 175, 22), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.title)
+            title_w = 175 if self.mode == "volume" else 225
+            p.drawText(QRectF(68, 15, title_w, 22), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                       p.fontMetrics().elidedText(self.title, Qt.TextElideMode.ElideRight, title_w))
 
-            pct_str = f"{int(round(self.val * 100))}%"
-            p.setPen(border_col)
-            p.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-            p.drawText(QRectF(235, 15, 58, 22), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, pct_str)
+            if self.mode == "volume":
+                pct_str = f"{int(round(self.val * 100))}%"
+                p.setPen(border_col)
+                p.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+                p.drawText(QRectF(235, 15, 58, 22), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, pct_str)
 
             # Прогрес-бар
             bar_bg = QRectF(68, 44, 224, 8)
@@ -426,9 +435,19 @@ class OSDOverlay(QWidget):
                 p.setBrush(border_col)
                 p.drawRoundedRect(QRectF(68, 44, fill_w, 8), 4, 4)
         else:
+            # Один рядок, або заголовок + дрібніший підпис (після "\n"), напр. назва відео
+            head, _, sub = self.title.partition("\n")
             p.setFont(QFont("Arial", 11, QFont.Weight.Bold))
             p.setPen(border_col if self.is_danger else QColor("#ffffff"))
-            p.drawText(QRectF(68, 12, 225, 50), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.title)
+            head = p.fontMetrics().elidedText(head, Qt.TextElideMode.ElideRight, 225)
+            if sub:
+                p.drawText(QRectF(68, 14, 225, 24), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, head)
+                p.setFont(QFont("Arial", 9))
+                p.setPen(QColor("#9aa0a6"))
+                p.drawText(QRectF(68, 37, 225, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                           p.fontMetrics().elidedText(sub, Qt.TextElideMode.ElideRight, 225))
+            else:
+                p.drawText(QRectF(68, 12, 225, 50), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, head)
         p.end()
 
 class ResetDialog(QDialog):
@@ -479,6 +498,26 @@ class EncoderCompoundWidget(QWidget):
         self.pulse_anim.setKeyValueAt(1.0, 0)
         self.pulse_anim.valueChanged.connect(self._update_pulse)
 
+        # Підсвітка фізичних дій на платі: натискання SW та обертання
+        self.hw_pressed = False
+        self.hw_sw_glow = 0.0
+        self.hw_sw_anim = QVariantAnimation(self)
+        self.hw_sw_anim.setDuration(260)
+        self.hw_sw_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.hw_sw_anim.setStartValue(1.0)
+        self.hw_sw_anim.setEndValue(0.0)
+        self.hw_sw_anim.valueChanged.connect(self._update_hw_sw_glow)
+
+        self.hw_rot_part = None
+        self.hw_rot_glow = 0.0
+        self.hw_knob_angle = 90.0     # положення "риски" на ручці, градуси
+        self.hw_rot_anim = QVariantAnimation(self)
+        self.hw_rot_anim.setDuration(320)
+        self.hw_rot_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.hw_rot_anim.setStartValue(1.0)
+        self.hw_rot_anim.setEndValue(0.0)
+        self.hw_rot_anim.valueChanged.connect(self._update_hw_rot_glow)
+
         # Сплин поглинання
         self.drop_ripple_progress = 0.0
         self.drop_ripple_target = None
@@ -495,6 +534,34 @@ class EncoderCompoundWidget(QWidget):
 
     def _update_drop_ripple(self, val):
         self.drop_ripple_progress = val
+        self.update()
+
+    def _update_hw_sw_glow(self, val):
+        self.hw_sw_glow = float(val)
+        self.update()
+
+    def _update_hw_rot_glow(self, val):
+        self.hw_rot_glow = float(val)
+        self.update()
+
+    def set_hw_pressed(self, pressed):
+        """Кнопку енкодера (SW) натиснули/відпустили на платі."""
+        if pressed:
+            self.hw_sw_anim.stop()
+            self.hw_pressed = True
+            self.hw_sw_glow = 1.0
+            self.update()
+        elif self.hw_pressed:
+            self.hw_pressed = False
+            self.hw_sw_anim.start()
+
+    def flash_rotation(self, direction):
+        """Енкодер повернули на платі: спалахує сектор напрямку, риска на ручці робить крок."""
+        self.hw_rot_part = "right" if direction == "right" else "left"
+        self.hw_knob_angle = (self.hw_knob_angle + (-24.0 if direction == "right" else 24.0)) % 360.0
+        self.hw_rot_anim.stop()
+        self.hw_rot_glow = 1.0
+        self.hw_rot_anim.start()
         self.update()
 
     def trigger_drop_effect(self, target_part):
@@ -767,6 +834,24 @@ class EncoderCompoundWidget(QWidget):
         if has_act(f"{self.enc_base_id}_R"): p.drawEllipse(QPointF(cx + 13.5, cy + 27.5), 2.5, 2.5)
         if has_act(self.enc_base_id): p.drawEllipse(QPointF(cx, cy), 3.0, 3.0)
 
+        # Фізичні дії на платі
+        if self.hw_sw_glow > 0.01:
+            p.setPen(QPen(QColor(0, 229, 255, int(255 * self.hw_sw_glow)), 2.0))
+            p.setBrush(QColor(0, 229, 255, int(90 * self.hw_sw_glow)))
+            p.drawPath(path_sw)
+        if self.hw_rot_glow > 0.01 and self.hw_rot_part:
+            g = self.hw_rot_glow
+            p.setPen(QPen(QColor(0, 229, 255, int(255 * g)), 2.0))
+            p.setBrush(QColor(0, 229, 255, int(90 * g)))
+            p.drawPath(path_r if self.hw_rot_part == "right" else path_l)
+            self._draw_curved_arrow(p, self.hw_rot_part == "left", QColor(255, 255, 255, int(255 * g)))
+            # риска на ручці показує напрямок і сам факт кроку
+            rad = math.radians(self.hw_knob_angle)
+            tick = QPen(QColor(0, 229, 255, int(255 * g)), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            p.setPen(tick)
+            p.drawLine(QPointF(cx + 9.5 * math.cos(rad), cy - 9.5 * math.sin(rad)),
+                       QPointF(cx + 15.0 * math.cos(rad), cy - 15.0 * math.sin(rad)))
+
         # Drop Ripple
         if self.drop_ripple_progress > 0 and self.drop_anim.state() == QVariantAnimation.State.Running:
             alpha = int((1.0 - self.drop_ripple_progress) * 255)
@@ -948,17 +1033,12 @@ class FloatingDragOverlay(QWidget):
         p.setPen(border_pen)
         p.drawRoundedRect(card_rect, radius, radius)
 
-        # 4. Іконка дії (або неонова крапка, якщо іконки немає)
+        # 4. Неонова енерго-крапка
         dot_x = card_rect.left() + 14
         dot_y = card_rect.center().y()
-        icon_name = icons.action_icon_name(self.action_val)
-        if icon_name:
-            icons.paint_icon(p, icon_name, QRectF(dot_x - 7, dot_y - 7, 14, 14), ACCENT)
-            dot_x += 4
-        else:
-            p.setBrush(QColor(ACCENT))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(QPointF(dot_x, dot_y), 3.5, 3.5)
+        p.setBrush(QColor(ACCENT))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(dot_x, dot_y), 3.5, 3.5)
 
         # 5. Текст дії
         p.setFont(QFont("Arial", 9, QFont.Weight.Bold))
@@ -970,7 +1050,7 @@ class FloatingDragOverlay(QWidget):
         p.end()
 
 class DraggableActionButton(QPushButton):
-    def __init__(self, text, val, main_app, parent=None, icon_name=None):
+    def __init__(self, text, val, main_app, parent=None):
         super().__init__(text, parent)
         self.val = val
         self.main_app = main_app
@@ -978,11 +1058,7 @@ class DraggableActionButton(QPushButton):
         self.is_dragging = False
         self.setObjectName("actionBtn")
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        # Іконка: явно задана або підібрана за типом дії (той самий набір, що й в OSD)
-        self._icon_name = icon_name or icons.action_icon_name(val)
-        self._custom_icon = None
         self.setIconSize(QSize(18, 18))
-        self.set_icon_staged(False)
         
         self.ghost_alpha = 255
         self.ghost_anim = QVariantAnimation(self)
@@ -991,15 +1067,8 @@ class DraggableActionButton(QPushButton):
         self.ghost_anim.valueChanged.connect(self._update_ghost)
 
     def set_custom_icon(self, qicon):
-        """Власна іконка (напр. іконка .exe-файлу) замість іконки з набору."""
-        self._custom_icon = qicon
+        """Іконка лише там, де вона несе інформацію (іконка .exe-файлу, глобус для сайту)."""
         self.setIcon(qicon)
-
-    def set_icon_staged(self, staged):
-        if self._custom_icon is not None:
-            return
-        if self._icon_name:
-            self.setIcon(icons.icon(self._icon_name, ICON_ACCENT if staged else ICON_COLOR))
 
     def _update_ghost(self, val):
         self.ghost_alpha = val
@@ -1194,6 +1263,16 @@ class PadButton(QPushButton):
         self.pulse_anim.setKeyValueAt(1.0, 0)
         self.pulse_anim.valueChanged.connect(self._update_pulse)
 
+        # Підсвітка фізичного натискання на платі
+        self.hw_pressed = False
+        self.hw_glow = 0.0
+        self.hw_anim = QVariantAnimation(self)
+        self.hw_anim.setDuration(260)
+        self.hw_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.hw_anim.setStartValue(1.0)
+        self.hw_anim.setEndValue(0.0)
+        self.hw_anim.valueChanged.connect(self._update_hw_glow)
+
         # Сплеск успішного поглинання
         self.drop_ripple_radius = 0.0
         self.drop_ripple_alpha = 0
@@ -1222,6 +1301,21 @@ class PadButton(QPushButton):
         self.pulse_color = QColor(color_hex)
         self.pulse_anim.stop()
         self.pulse_anim.start()
+
+    def _update_hw_glow(self, val):
+        self.hw_glow = float(val)
+        self.update()
+
+    def set_hw_pressed(self, pressed):
+        """Кнопку натиснули/відпустили на самій платі: світиться, поки тримають, і згасає."""
+        if pressed:
+            self.hw_anim.stop()
+            self.hw_pressed = True
+            self.hw_glow = 1.0
+            self.update()
+        elif self.hw_pressed:
+            self.hw_pressed = False
+            self.hw_anim.start()
         
     def set_has_action(self, state):
         self.has_action = state
@@ -1287,6 +1381,12 @@ class PadButton(QPushButton):
             c = QColor(ACCENT) if self.is_drag_valid else QColor(BTN_DANGER)
             p.setBrush(QColor(c.red(), c.green(), c.blue(), 45))
             p.setPen(QPen(c, 2.0))
+            p.drawRoundedRect(1, 1, self.width() - 2, self.height() - 2, 15, 15)
+
+        if self.hw_glow > 0.01:
+            c = QColor(ACCENT)
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), int(70 * self.hw_glow)))
+            p.setPen(QPen(QColor(c.red(), c.green(), c.blue(), int(255 * self.hw_glow)), 2.0))
             p.drawRoundedRect(1, 1, self.width() - 2, self.height() - 2, 15, 15)
 
         if self.drop_ripple_alpha > 0:
@@ -1513,12 +1613,12 @@ class ActionWidget(QPushButton):
     def show_menu(self):
         self.unhook_if_listening()
         menu = QMenu(self)
-        a_tap = menu.addAction(icons.icon("tap", ICON_COLOR), "Натиснути і відпустити")
-        a_press = menu.addAction(icons.icon("download", ICON_COLOR), "Затиснути клавішу")
-        a_release = menu.addAction(icons.icon("export", ICON_COLOR), "Відпустити клавішу")
-        a_hotkey = menu.addAction(icons.icon("keyboard", ICON_COLOR), "Комбінація (швидко)")
-        a_text = menu.addAction(icons.icon("type", ICON_COLOR), "Ввести текст")
-        a_move = menu.addAction(icons.icon("cursor", ICON_COLOR), "Перемістити курсор (X, Y)")
+        a_tap = menu.addAction("Натиснути і відпустити")
+        a_press = menu.addAction("Затиснути клавішу")
+        a_release = menu.addAction("Відпустити клавішу")
+        a_hotkey = menu.addAction("Комбінація (швидко)")
+        a_text = menu.addAction("Ввести текст")
+        a_move = menu.addAction("Перемістити курсор (X, Y)")
         menu.addSeparator()
 
         del_action = QWidgetAction(menu)
@@ -2665,7 +2765,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Налаштування")
-        self.setFixedSize(380, 225)
+        self.setFixedSize(400, 400)
         self.setStyleSheet(f"background-color: {BG_MAIN}; color: {TEXT_MAIN};")
 
         layout = QVBoxLayout(self)
@@ -2722,13 +2822,64 @@ class SettingsDialog(QDialog):
         self.cb_show_osd.setStyleSheet(checkbox_style)
         layout.addWidget(self.cb_show_osd)
 
-        layout.addSpacing(5)
+        section_style = f"color: {TEXT_SUB}; font-size: 11px; font-weight: bold; margin-top: 6px;"
+        plain_btn_style = (f"QPushButton {{ background-color: transparent; border: 1px solid #333; padding: 8px; "
+                           f"border-radius: 5px; text-align: left; padding-left: 12px; font-weight: normal; }} "
+                           f"QPushButton:hover {{ border: 1px solid {ACCENT}; }}")
+
+        # --- Плата
+        main = self.parent()
+        if main.device_connected:
+            fw = main.fw_version or "≤ 1.0"
+            board_text = f"МАКРОПАД  ·  прошивка {fw}, протокол v{main.hw_proto}"
+        else:
+            board_text = "МАКРОПАД  ·  не підключено"
+        lbl_board = QLabel(board_text)
+        lbl_board.setStyleSheet(section_style)
+        layout.addWidget(lbl_board)
+
+        self.btn_flash = QPushButton("Прошити плату з файлу (.uf2)…")
+        self.btn_flash.setIcon(icons.icon("download", ICON_COLOR))
+        self.btn_flash.setIconSize(QSize(16, 16))
+        self.btn_flash.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_flash.setStyleSheet(plain_btn_style)
+        self.btn_flash.setEnabled(main.device_connected)
+        self.btn_flash.clicked.connect(self.flash_board)
+        layout.addWidget(self.btn_flash)
+
+        # --- Поточний профіль
+        profiles = main.config.get("PROFILES", [])
+        prof_name = profiles[main.active_profile_idx].get("name", "") if 0 <= main.active_profile_idx < len(profiles) else ""
+        lbl_prof = QLabel(f"ПРОФІЛЬ  ·  {prof_name}")
+        lbl_prof.setStyleSheet(section_style)
+        layout.addWidget(lbl_prof)
+
+        self.btn_reset = QPushButton("Скинути призначення цього профілю…")
+        self.btn_reset.setIcon(icons.icon("eraser", ICON_DANGER))
+        self.btn_reset.setIconSize(QSize(16, 16))
+        self.btn_reset.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_reset.setStyleSheet(plain_btn_style.replace(f"border: 1px solid {ACCENT}", f"border: 1px solid {BTN_DANGER}"))
+        self.btn_reset.clicked.connect(self.reset_profile)
+        layout.addWidget(self.btn_reset)
+
+        layout.addStretch()
 
         btn_close = QPushButton("Закрити")
         btn_close.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_close.clicked.connect(self.accept)
         btn_close.setStyleSheet(f"QPushButton {{ background-color: {BG_HOVER}; border: 1px solid #333; padding: 8px; border-radius: 5px; font-weight: bold; }} QPushButton:hover {{ border: 1px solid {ACCENT}; }}")
         layout.addWidget(btn_close)
+
+    def reset_profile(self):
+        main = self.parent()
+        if ResetDialog(self).exec():
+            main.clear_profile(main.active_profile_idx)
+
+    def flash_board(self):
+        main = self.parent()
+        main.flash_firmware_from_file(self)
+        if main._flashing:
+            self.accept()
 
     def toggle_auto_prof(self):
         self.parent().config["auto_profile_switch"] = self.cb_auto_prof.isChecked()

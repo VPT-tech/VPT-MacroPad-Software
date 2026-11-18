@@ -10,6 +10,8 @@
 | `threads.py` | Фонові потоки: Serial, аудіо-мікшер, активне вікно, WebSocket (YouTube) |
 | `widgets.py`, `config.py`, `utils.py`, `updater.py` | UI-віджети, пресети/мапінги, WinAPI-утиліти, оновлення |
 | `firmware/VPT_MacroPad/` | Прошивка RP2040 (Arduino-Pico core) |
+| `firmware/uf2/` | Зібрана прошивка — можна прошити з програми без Arduino IDE |
+| `extension/` | Розширення Chrome/Edge для керування YouTube (див. `extension/README.md`) |
 | `tests/` | Тести клієнта, хостові тести прошивки, наскрізний тест HW ↔ SW |
 
 ## Як розподіляється робота між платою і ПК
@@ -57,13 +59,24 @@ make -C tests/firmware_sim
 # Тести Python-клієнта + наскрізний тест з прошивкою, що працює окремим процесом
 pip install -r requirements.txt
 QT_QPA_PLATFORM=offscreen pytest tests
+
+# Розширення YouTube: логіка + наскрізний тест у справжньому Chromium (Playwright)
+node --test tests/extension/*.test.mjs
+node tests/extension/e2e.cjs
 ```
 
 Наскрізний тест (`tests/test_e2e_hw_sync.py`) запускає справжнє вікно `MacroPadPro` і `SerialThread`,
 підключені до прошивки, зібраної під хост, — і для поточної прошивки, і для старої v1.0
 (`tests/firmware_sim/legacy/`), щоб гарантувати сумісність з ще не оновленими платами.
 
-## Збірка прошивки
+## Прошивка плати
+
+Найпростіше — з програми: **Налаштування → Прошити плату з файлу (.uf2)…** і обрати
+`firmware/uf2/VPT_MacroPad_v<версія>.uf2`. Програма перевіряє, що це цілісний UF2 для RP2040,
+сама переводить плату в режим завантажувача, копіює файл і після перезапуску відновлює
+призначення кнопок.
+
+Збірка з вихідників:
 
 ```bash
 arduino-cli core install rp2040:rp2040   # https://github.com/earlephilhower/arduino-pico

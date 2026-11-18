@@ -92,6 +92,47 @@ def is_verified(path):
     return bool(exp) and verify_file(path, exp)
 
 
+UF2_MAGIC_START0 = 0x0A324655
+UF2_MAGIC_START1 = 0x9E5D5157
+UF2_MAGIC_END = 0x0AB16F30
+UF2_FLAG_FAMILY_ID = 0x00002000
+UF2_FAMILY_RP2040 = 0xE48BFF56
+
+
+def inspect_uf2(path, max_bytes=8 * 1024 * 1024):
+    """Перевіряє, що файл — цілісний UF2-образ саме для RP2040 (а не щось випадкове).
+    Повертає (True, кількість_блоків) або (False, причина)."""
+    import struct
+    try:
+        size = os.path.getsize(path)
+        if size == 0 or size % 512 != 0:
+            return False, "розмір файлу не кратний 512 байтам"
+        if size > max_bytes:
+            return False, "файл завеликий для прошивки"
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return False, str(e)
+
+    total = None
+    for i in range(0, len(data), 512):
+        m0, m1, flags, addr, psize, block_no, num_blocks, family = struct.unpack_from("<8I", data, i)
+        (m_end,) = struct.unpack_from("<I", data, i + 508)
+        if m0 != UF2_MAGIC_START0 or m1 != UF2_MAGIC_START1 or m_end != UF2_MAGIC_END:
+            return False, "це не файл UF2"
+        if not (flags & UF2_FLAG_FAMILY_ID) or family != UF2_FAMILY_RP2040:
+            return False, "прошивка не для RP2040"
+        if psize > 476 or not (0x10000000 <= addr < 0x11000000):
+            return False, "некоректний блок UF2"
+        if total is None:
+            total = num_blocks
+        if num_blocks != total or block_no != i // 512:
+            return False, "пошкоджена послідовність блоків"
+    if total != len(data) // 512:
+        return False, "файл обрізаний"
+    return True, total
+
+
 def get_latest_release_data():
     is_beta = False
     try:

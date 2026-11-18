@@ -155,6 +155,7 @@ class MacroPadPro(QMainWindow):
         self.mute_poller.start()
 
         self.ws_thread = WebSocketServerThread()
+        self.ws_thread.yt_feedback.connect(self.on_yt_feedback)
         self.ws_thread.start()
 
         self.serial_thread = SerialThread()
@@ -163,6 +164,7 @@ class MacroPadPro(QMainWindow):
         # executor — QObject у GUI-потоці, тож з'єднання автоматично queued:
         # уся обробка подій відбувається в GUI-потоці
         self.serial_thread.macro_signal.connect(self.executor.execute)
+        self.executor.hw_activity.connect(self.on_hw_activity)
         self.serial_thread.start()
 
         self.setup_tray()
@@ -284,6 +286,76 @@ class MacroPadPro(QMainWindow):
             self.lbl_status.setToolTip("")
             # Плата зникла під час утримання кнопки — відпускаємо все, що тримає ПК
             self.executor.on_device_disconnected()
+            self.clear_hw_highlights()
+
+    @staticmethod
+    def _fmt_time(sec):
+        sec = int(max(0, sec))
+        h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    def on_yt_feedback(self, fb):
+        """Розширення браузера повідомило результат команди — показуємо його в OSD."""
+        if not fb.get("ok"):
+            text = {
+                "no_tab": "YouTube: немає відкритого відео",
+                "no_video": "YouTube: немає відкритого відео",
+                "unsupported": "YouTube: на цій сторінці недоступно",
+            }.get(fb.get("err"), "YouTube: не вдалося виконати")
+            self.trigger_osd("status", text, is_danger=True, icon_text="youtube")
+            return
+
+        cmd = fb.get("cmd", "")
+        title = fb.get("title", "")
+        sub = f"\n{title}" if title else ""
+        if cmd in ("PLAYPAUSE", "PLAY", "PAUSE"):
+            self.trigger_osd("status", ("Пауза" if fb["paused"] else "Відтворення") + sub, icon_text="play-pause")
+        elif cmd in ("SEEK", "RESTART", "SEEKPCT"):
+            if fb["live"] or fb["dur"] <= 0:
+                self.trigger_osd("status", "Пряма трансляція" + sub, icon_text="timeline")
+            else:
+                self.trigger_osd("progress", f"{self._fmt_time(fb['time'])} / {self._fmt_time(fb['dur'])}",
+                                 fb["time"] / fb["dur"], icon_text="timeline")
+        elif cmd in ("VOL", "MUTE"):
+            muted = fb["muted"] or fb["vol"] <= 0
+            self.trigger_osd("volume", "Гучність YouTube", 0.0 if fb["muted"] else fb["vol"] / 100.0,
+                             icon_text="volume-x" if muted else "volume", is_danger=fb["muted"])
+        elif cmd in ("SPEED", "SPEEDSET"):
+            self.trigger_osd("status", f"Швидкість {fb['rate']:g}×" + sub, icon_text="forward")
+        elif cmd == "NEXT":
+            self.trigger_osd("status", "Наступне відео", icon_text="next")
+        elif cmd == "PREV":
+            self.trigger_osd("status", "Попереднє відео" if fb.get("note") != "restart" else "На початок", icon_text="prev")
+        elif cmd == "CAPTIONS":
+            text = {"captions_on": "Субтитри увімкнено", "captions_off": "Субтитри вимкнено"}.get(fb.get("note"), "Субтитри недоступні")
+            self.trigger_osd("status", text, icon_text="captions", is_danger=fb.get("note") == "na")
+        elif cmd == "THEATER":
+            self.trigger_osd("status", "Режим кінотеатру", icon_text="theater")
+        elif cmd == "LIKE":
+            text = {"like_on": "Лайк поставлено", "like_off": "Лайк знято"}.get(fb.get("note"), "Кнопку лайка не знайдено")
+            self.trigger_osd("status", text + (sub if fb.get("note") in ("like_on", "like_off") else ""),
+                             icon_text="heart", is_danger=fb.get("note") == "na")
+
+    def on_hw_activity(self, key, kind):
+        """Фізичне натискання/обертання підсвічує відповідний елемент макета."""
+        if not self.isVisible() or self.isMinimized():
+            return
+        if key.endswith("_SW"):
+            w = self.ui_pad_btns.get(key[:-3])
+            if w is not None:
+                w.set_hw_pressed(kind == "press")
+        elif key.startswith("ENC_"):
+            w = self.ui_pad_btns.get(key)
+            if w is not None and kind in ("left", "right"):
+                w.flash_rotation(kind)
+        else:
+            w = self.ui_pad_btns.get(key)
+            if w is not None:
+                w.set_hw_pressed(kind == "press")
+
+    def clear_hw_highlights(self):
+        for w in self.ui_pad_btns.values():
+            w.set_hw_pressed(False)
 
     def run_silent_update_check(self):
         if getattr(self, 'bg_updater', None) is not None and self.bg_updater.isRunning():
@@ -408,6 +480,34 @@ class MacroPadPro(QMainWindow):
 
         elif exe_path and os.path.exists(exe_path):
             self.run_exe_update(exe_path)
+
+    def flash_firmware_from_file(self, parent=None):
+        """Прошиває плату вибраним .uf2 без Arduino IDE (плата сама переходить у режим завантажувача)."""
+        parent = parent or self
+        if not self.device_connected:
+            QMessageBox.information(parent, "Прошивка плати", "Спершу підключіть макропад.")
+            return
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        start_dir = os.path.join(base_dir, "firmware", "uf2")
+        path, _ = QFileDialog.getOpenFileName(parent, "Файл прошивки", start_dir if os.path.isdir(start_dir) else "",
+                                              "Прошивка UF2 (*.uf2)")
+        if not path:
+            return
+        ok, info = updater_mod.inspect_uf2(path)
+        if not ok:
+            QMessageBox.warning(parent, "Прошивка плати", f"Цей файл не підходить: {info}.")
+            return
+        current = self.fw_version or "≤ 1.0"
+        answer = QMessageBox.question(
+            parent, "Прошивка плати",
+            f"Прошити макропад файлом\n{os.path.basename(path)}?\n\n"
+            f"Зараз на платі: {current}. Плата перезавантажиться, а призначення кнопок "
+            "програма відновить автоматично.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        updater_mod.register_verified(path, updater_mod.sha256_file(path))
+        self.apply_update("", path)
 
     def run_exe_update(self, exe_path):
         from PySide6.QtWidgets import QApplication
@@ -780,6 +880,26 @@ class MacroPadPro(QMainWindow):
         self.refresh_profiles_ui()
         self.switch_profile(len(profiles) - 1)
 
+    def duplicate_profile(self, idx):
+        profiles = self.config.get("PROFILES", [])
+        if not (0 <= idx < len(profiles)):
+            return
+        new_prof = copy.deepcopy(profiles[idx])
+        existing = {p.get("name", "") for p in profiles}
+        base = f"{profiles[idx].get('name', 'Профіль')} (копія)"
+        name, n = base, 2
+        while name in existing:
+            name = f"{base} {n}"
+            n += 1
+        new_prof["name"] = name
+        # Прив'язку до .exe не копіюємо: дві прив'язки до однієї програми конфліктували б
+        new_prof["app_bind"] = ""
+        # Додаємо в кінець, щоб не зсувати індекси в діях "Перейти/Утримувати профіль N"
+        profiles.append(new_prof)
+        self.save_config()
+        self.refresh_profiles_ui()
+        self.switch_profile(len(profiles) - 1)
+
     def export_profile(self, idx):
         profiles = self.config.get("PROFILES", [])
         if not (0 <= idx < len(profiles)):
@@ -992,8 +1112,15 @@ class MacroPadPro(QMainWindow):
         def open_store():
             webbrowser.open("https://chromewebstore.google.com/detail/macropad-yt-control/deihndpelcbeahgbambapfmaaidhonni?hl=ru&utm_source=ext_sidebar")
 
+        versions = [v for v in self.ws_thread.client_versions.values()]
+        if not versions:
+            status = "Зараз розширення не підключене."
+        elif any(v for v in versions):
+            status = f"Розширення підключене (версія {max(v for v in versions if v)})."
+        else:
+            status = "Підключене старе розширення — оновіть його,\nщоб працювали всі дії YouTube."
         self.yt_popup = InfoPopup(
-            "Для керування YouTube потрібно встановити\nнаше розширення для браузера.",
+            "Для керування YouTube потрібно встановити\nнаше розширення для браузера.\n\n" + status,
             "Скачати розширення",
             open_store,
             icon_name="download"
@@ -1060,7 +1187,12 @@ class MacroPadPro(QMainWindow):
         w = self.right_panel.width()
         h = self.right_panel.height()
 
-        M_W = self.multi_editor.width() if hasattr(self, 'multi_editor') else 0
+        editor_w = self.multi_editor.width() if hasattr(self, 'multi_editor') else 0
+        # Редактор групи (340 px) стає поруч із макетом лише коли обидва вміщаються.
+        # Інакше він працює як висувна панель поверх, а макет лишається на місці
+        # (раніше макет виштовхувало під колонку профілів і за межі вікна).
+        side_by_side = w >= 30 + 340 + 20 + self.pad_frame.width() + 90
+        M_W = editor_w if side_by_side else 0
 
         MAX_ED = 140
         MAX_VKB = 360
@@ -1080,7 +1212,11 @@ class MacroPadPro(QMainWindow):
         available_w_for_center = w - 60 - M_W
         pad_x = (30 + M_W) + (available_w_for_center - self.pad_frame.width()) // 2 + 12
         if pad_x < (30 + M_W):
-            pad_x = 30 + M_W
+            pad_x = 30 + M_W if M_W else 10
+        # Макет ніколи не заходить під колонку профілів (у згорнутому стані вона 40 px + відступ).
+        # На мінімальній ширині вікна центроване положення перекривало профілі.
+        profiles_left = w - 40 - 22
+        pad_x = max(10, min(pad_x, profiles_left - 10 - self.pad_frame.width()))
 
         current_container_width = 40
         if hasattr(self, 'ui_profiles'):
@@ -1093,7 +1229,7 @@ class MacroPadPro(QMainWindow):
             self.profiles_scroll.raise_()
 
         if hasattr(self, 'multi_editor'):
-            self.multi_editor.setGeometry(30, 30, M_W, h - 60)
+            self.multi_editor.setGeometry(30, 30, editor_w, h - 60)
             self.multi_editor.raise_()
 
         self.macro_editor.setGeometry(30 + M_W, Y_ed, max(10, w - 60 - M_W), H_ed)
@@ -1103,11 +1239,6 @@ class MacroPadPro(QMainWindow):
         if hasattr(self, 'btn_update'):
             bw = 180
             self.btn_update.setGeometry((30 + M_W) + (rem_w - bw) // 2, 10, bw, 40)
-        if hasattr(self, 'btn_reset'):
-            bw = self.btn_reset.width()
-            bh = self.btn_reset.height()
-            self.btn_reset.setGeometry(w - bw - 30, h - bh - 20, bw, bh)
-
         if hasattr(self, 'btn_main_help'):
             self.btn_main_help.setGeometry(15 + M_W, h - 35, 20, 20)
             self.btn_main_help.raise_()
@@ -1329,11 +1460,6 @@ class MacroPadPro(QMainWindow):
         self.vkb_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.vkb_anim.valueChanged.connect(self.set_vkb_height)
 
-        self.btn_reset = QPushButton("Скинути налаштування", self.right_panel)
-        self.btn_reset.setFixedSize(200, 40)
-        self.btn_reset.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_reset.clicked.connect(self.confirm_reset)
-
         main_layout.addWidget(self.left_panel)
         main_layout.addWidget(self.right_panel)
 
@@ -1390,13 +1516,26 @@ class MacroPadPro(QMainWindow):
         lbl.setStyleSheet(f"color: {ACCENT}; font-weight: bold; margin-top: 15px; margin-bottom: 5px;")
         layout.addWidget(lbl)
 
-    def add_action(self, layout, text, val, icon_name=None):
+    def add_action(self, layout, text, val):
         from widgets import DraggableActionButton
-        b = DraggableActionButton(text, val, self, icon_name=icon_name)
+        b = DraggableActionButton(text, val, self)
         b.clicked.connect(lambda checked, t=text, v=val, btn=b: self.stage_action(t, v, btn))
         layout.addWidget(b)
         self.all_action_btns.append(b)
         return b
+
+    def add_action_row(self, layout, items):
+        """Кілька коротких дій в один рядок (компактніше, ніж кожна окремим рядком)."""
+        from widgets import DraggableActionButton
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        for text, val in items:
+            b = DraggableActionButton(text, val, self)
+            b.setFixedHeight(40)
+            b.clicked.connect(lambda checked, v=val, btn=b: self.stage_action(self.get_fname(v), v, btn))
+            row.addWidget(b, stretch=1)
+            self.all_action_btns.append(b)
+        layout.addLayout(row)
 
     def add_deletable_item(self, layout, text, val, delete_callback, icon=None):
         from widgets import DraggableActionButton
@@ -1530,6 +1669,18 @@ class MacroPadPro(QMainWindow):
 
         m.addLayout(yt_lay)
 
+        self.add_action_row(m, [("Попереднє відео", "EXT:YT_PREV"), ("Наступне відео", "EXT:YT_NEXT")])
+        self.add_action_row(m, [("Гучність −", "EXT:YT_VOL_DOWN"), ("Гучність +", "EXT:YT_VOL_UP")])
+        self.add_action_row(m, [("Швидкість −", "EXT:YT_SPEED_DOWN"), ("Швидкість +", "EXT:YT_SPEED_UP")])
+        self.add_action_row(m, [("Звук вкл / викл", "EXT:YT_MUTE"), ("Швидкість 1×", "EXT:YT_SPEED_RESET")])
+        self.add_action_row(m, [("Субтитри", "EXT:YT_CAPTIONS"), ("Кінотеатр", "EXT:YT_THEATER")])
+        self.add_action_row(m, [("Лайк", "EXT:YT_LIKE"), ("На початок", "EXT:YT_RESTART")])
+
+        lbl_yt_enc = QLabel("Для крутилки (центр енкодера):")
+        lbl_yt_enc.setStyleSheet(f"color: {TEXT_SUB}; margin-top: 8px;")
+        m.addWidget(lbl_yt_enc)
+        self.add_action_row(m, [("Перемотка", "ENC:YT_SEEK"), ("Гучність", "ENC:YT_VOL"), ("Швидкість", "ENC:YT_SPEED")])
+
         self.add_title(m, "Мікрофон")
         self.add_action(m, "Вимкнути мікрофон глобально", "MED:MIC_MUTE")
 
@@ -1558,14 +1709,14 @@ class MacroPadPro(QMainWindow):
         lbl2.setStyleSheet(f"color: {TEXT_SUB}; margin-top: 10px;")
         m.addWidget(lbl2)
 
-        btn_vol = DraggableActionButton("Зміна гучності", "", self, icon_name="mixer")
+        btn_vol = DraggableActionButton("Зміна гучності", "", self)
         btn_vol.setFixedHeight(45)
         btn_vol.clicked.connect(lambda checked, btn=btn_vol: self.stage_action(f"Гучність: {self.combo_apps.currentText()}", f"ENC:APP:{self.combo_apps.currentData()}", btn))
         self.combo_apps.currentIndexChanged.connect(lambda idx, b=btn_vol: setattr(b, 'val', f"ENC:APP:{self.combo_apps.currentData()}"))
         m.addWidget(btn_vol)
         self.all_action_btns.append(btn_vol)
 
-        btn_mute = DraggableActionButton("Вимкнути звук", "", self, icon_name="volume-x")
+        btn_mute = DraggableActionButton("Вимкнути звук", "", self)
         btn_mute.setFixedHeight(45)
         btn_mute.clicked.connect(lambda checked, btn=btn_mute: self.stage_action(f"Мут: {self.combo_apps.currentText()}", f"APP_MUTE:{self.combo_apps.currentData()}", btn))
         self.combo_apps.currentIndexChanged.connect(lambda idx, b=btn_mute: setattr(b, 'val', f"APP_MUTE:{self.combo_apps.currentData()}"))
@@ -1681,14 +1832,12 @@ class MacroPadPro(QMainWindow):
 
     def set_vkb_visible(self, visible):
         if visible and self.vkb_container.maximumHeight() == 0:
-            self.btn_reset.hide()
             self.vkb_anim.setStartValue(0)
             self.vkb_anim.setEndValue(360)
             self.vkb_anim.start()
             self.btn_vkb.setText("СХОВАТИ КЛАВІАТУРУ")
             self.btn_vkb.setStyleSheet("background-color: #1a1a1a; border: 1px solid #444;")
         elif not visible and self.vkb_container.maximumHeight() > 0:
-            self.btn_reset.show()
             self.vkb_anim.setStartValue(self.vkb_container.maximumHeight())
             self.vkb_anim.setEndValue(0)
             self.vkb_anim.start()
@@ -1769,7 +1918,10 @@ class MacroPadPro(QMainWindow):
         if self.config["RECENTS"]["EXE"] or self.config["RECENTS"]["URL"]:
             self.add_title(self.recents_layout, "Збережені програми та посилання")
             for ru in reversed(self.config["RECENTS"]["URL"]):
-                self.add_deletable_item(self.recents_layout, ru, f"URL:{ru}", self.delete_recent)
+                # У цьому списку змішані сайти й програми: програми мають власну іконку,
+                # сайти — глобус, щоб їх було видно з першого погляду
+                self.add_deletable_item(self.recents_layout, ru, f"URL:{ru}", self.delete_recent,
+                                        icons.icon("globe", ICON_MUTED))
             for re in reversed(self.config["RECENTS"]["EXE"]):
                 clean_exe = os.path.basename(re).replace(".exe", "")
                 icon = QIcon()
@@ -1967,10 +2119,9 @@ class MacroPadPro(QMainWindow):
             except Exception:
                 pass
 
-            mode_icon = {"Toggle": "toggle", "Repeat while held": "repeat"}.get(m_type, "macro")
             row = QHBoxLayout()
 
-            b = DraggableActionButton(f"{m_name} [{m_type}]", f"MACRO:{m_name}", self, icon_name=mode_icon)
+            b = DraggableActionButton(f"{m_name} [{m_type}]", f"MACRO:{m_name}", self)
             b.clicked.connect(lambda checked, t=f"Макрос: {m_name}", v=f"MACRO:{m_name}", btn=b: self.stage_action(t, v, btn))
             row.addWidget(b, stretch=1)
             self.all_action_btns.append(b)
@@ -2069,11 +2220,6 @@ class MacroPadPro(QMainWindow):
         if self.selected_btn == bid:
             self.update_assign_ui()
 
-    def confirm_reset(self):
-        dialog = ResetDialog(self)
-        if dialog.exec():
-            self.clear_profile(self.active_profile_idx)
-
     def stage_action(self, name, val, btn_obj=None):
         self.staged_name = name
         self.staged_val = val
@@ -2082,16 +2228,12 @@ class MacroPadPro(QMainWindow):
             b.setProperty("staged", "false")
             b.style().unpolish(b)
             b.style().polish(b)
-            if hasattr(b, "set_icon_staged"):
-                b.set_icon_staged(False)
 
         if btn_obj:
             try:
                 btn_obj.setProperty("staged", "true")
                 btn_obj.style().unpolish(btn_obj)
                 btn_obj.style().polish(btn_obj)
-                if hasattr(btn_obj, "set_icon_staged"):
-                    btn_obj.set_icon_staged(True)
             except RuntimeError:
                 pass
 
@@ -2215,6 +2357,11 @@ class MacroPadPro(QMainWindow):
         show_act.triggered.connect(self.show_window)
         tray_menu.addAction(show_act)
 
+        # Перемикання профілю прямо з трею; список будується при кожному відкритті меню
+        self.tray_profiles_menu = tray_menu.addMenu("Профіль")
+        self.tray_profiles_menu.aboutToShow.connect(self._fill_tray_profiles_menu)
+        self._fill_tray_profiles_menu()
+
         tray_menu.addSeparator()
 
         quit_act = QAction("Вихід", self)
@@ -2224,6 +2371,15 @@ class MacroPadPro(QMainWindow):
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self.tray_activated)
         self.tray_icon.show()
+
+    def _fill_tray_profiles_menu(self):
+        menu = self.tray_profiles_menu
+        menu.clear()
+        for i, prof in enumerate(self.config.get("PROFILES", [])):
+            act = menu.addAction(f"{i + 1}. {prof.get('name', 'Профіль')}")
+            act.setCheckable(True)
+            act.setChecked(i == self.active_profile_idx)
+            act.triggered.connect(lambda checked=False, idx=i: self.switch_profile(idx, from_hotkey=True))
 
     def tray_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
@@ -2256,6 +2412,17 @@ class MacroPadPro(QMainWindow):
     def closeEvent(self, event):
         event.ignore()
         self.hide()
+        # Один раз пояснюємо, що програма не закрилась, а працює у фоні
+        if not self.config.get("tray_hint_shown", False):
+            self.config["tray_hint_shown"] = True
+            self.save_config()
+            try:
+                self.tray_icon.showMessage(
+                    "VPT | Pad працює у фоні",
+                    "Макропад і далі активний. Відкрити вікно або вийти можна через значок у треї.",
+                    QSystemTrayIcon.MessageIcon.Information, 6000)
+            except Exception:
+                pass
 
     def nativeEvent(self, eventType, message):
         try:

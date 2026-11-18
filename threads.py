@@ -1,6 +1,8 @@
 # threads.py
 import gc
 import os
+import json
+import math
 import time
 import threading
 import serial
@@ -52,7 +54,52 @@ def _ws_request_origin(websocket):
         return None
 
 
+def sanitize_yt_feedback(msg):
+    """Відповідь розширення -> словник лише з очікуваними полями й типами.
+    Дані приходять з браузера, тому нічому не довіряємо: обрізаємо рядки, перевіряємо числа."""
+    def _s(key, limit):
+        v = msg.get(key)
+        return v[:limit] if isinstance(v, str) else ""
+
+    def _f(key, lo, hi, default=0.0):
+        v = msg.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return default
+        v = float(v)
+        if not math.isfinite(v):
+            return default
+        return max(lo, min(hi, v))
+
+    return {
+        "cmd": _s("cmd", 24),
+        "ok": msg.get("ok") is True,
+        "err": _s("err", 24),
+        "note": _s("note", 24),
+        "site": _s("site", 12),
+        "title": " ".join(_s("title", 200).split())[:120],
+        "paused": msg.get("paused") is True,
+        "muted": msg.get("muted") is True,
+        "live": msg.get("live") is True,
+        "time": _f("time", 0.0, 1e7),
+        "dur": _f("dur", 0.0, 1e7),
+        "vol": _f("vol", 0.0, 100.0),
+        "rate": _f("rate", 0.0, 16.0, 1.0),
+    }
+
+
 class WebSocketServerThread(QThread):
+    """Локальний WebSocket-сервер для розширення браузера (керування YouTube).
+
+    Програма -> розширення: текстові команди (YT_PLAYPAUSE, YT_FWD:10, YT_VOL:-5 ...).
+    Розширення -> програма: JSON {"t": "hello"|"ping"|"active"|"result", ...}.
+    Якщо розширення стоїть у кількох браузерах, команду отримує лише один з них —
+    той, де YouTube був активний останнім; якщо там немає відео, пробуємо наступний.
+    """
+    yt_feedback = Signal(dict)
+
+    RETRY_WINDOW_SEC = 1.5
+    MAX_MESSAGE_BYTES = 8192
+
     def __init__(self, host="localhost", port=8765):
         super().__init__()
         self.host = host
@@ -62,11 +109,20 @@ class WebSocketServerThread(QThread):
         self.server = None
         self.is_running = True
         self.rejected_origins = []
+        self.client_versions = {}      # websocket -> версія розширення ("" для старого)
+        self._conn_order = []          # клієнти в порядку підключення
+        self._preferred = None         # браузер, де YouTube був активний останнім
+        self._last_cmd = None          # (команда, час, {клієнти, яким уже надсилали})
+
+    @property
+    def has_clients(self):
+        return bool(self.clients)
 
     async def start_server(self):
         self.loop = asyncio.get_running_loop()
         try:
-            async with websockets.serve(self.handler, self.host, self.port) as server:
+            async with websockets.serve(self.handler, self.host, self.port,
+                                        max_size=self.MAX_MESSAGE_BYTES) as server:
                 self.server = server
                 while self.is_running:
                     await asyncio.sleep(0.2)
@@ -89,26 +145,90 @@ class WebSocketServerThread(QThread):
                 pass
             return
         self.clients.add(websocket)
+        self.client_versions[websocket] = ""
+        self._conn_order.append(websocket)
         try:
-            await websocket.wait_closed()
+            async for raw in websocket:
+                try:
+                    await self._on_message(websocket, raw)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         finally:
             self.clients.discard(websocket)
+            self.client_versions.pop(websocket, None)
+            if websocket in self._conn_order:
+                self._conn_order.remove(websocket)
+            if self._preferred is websocket:
+                self._preferred = None
+
+    async def _on_message(self, websocket, raw):
+        if not isinstance(raw, str):
+            return
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(msg, dict):
+            return
+        kind = msg.get("t")
+        if kind == "hello":
+            v = msg.get("v")
+            self.client_versions[websocket] = v[:16] if isinstance(v, str) else "?"
+        elif kind == "active":
+            # У цьому браузері щойно заграло відео YouTube — він стає ціллю команд
+            self._preferred = websocket
+        elif kind == "result":
+            fb = sanitize_yt_feedback(msg)
+            if fb["ok"]:
+                self._preferred = websocket
+            elif fb["err"] in ("no_tab", "no_video") and await self._retry_on_other_client(websocket):
+                return   # спитали інший браузер — чекаємо його відповідь
+            self.yt_feedback.emit(fb)
+
+    async def _retry_on_other_client(self, failed_ws):
+        last = self._last_cmd
+        if not last or (time.monotonic() - last[1]) > self.RETRY_WINDOW_SEC:
+            return False
+        cmd, _, tried = last
+        tried.add(failed_ws)
+        for ws in reversed(self._conn_order):
+            if ws not in tried:
+                tried.add(ws)
+                try:
+                    await ws.send(cmd)
+                    return True
+                except Exception:
+                    continue
+        return False
 
     def send_command(self, cmd):
+        """Надсилає команду розширенню. Повертає False, якщо жодне розширення не підключене."""
         loop = self.loop
         if not loop or not self.clients or not loop.is_running():
-            return
+            return False
 
-        async def send_to_all():
-            for ws in list(self.clients):
+        async def _send():
+            target = self._preferred if self._preferred in self.clients else None
+            if target is None:
+                # Нових розширень, що повідомили про активність, немає. Старе розширення (без версії)
+                # не відповідає на команди, тож надсилаємо всім, як раніше.
+                modern = [ws for ws in self._conn_order if self.client_versions.get(ws)]
+                targets = modern[-1:] if modern else list(self.clients)
+            else:
+                targets = [target]
+            self._last_cmd = (cmd, time.monotonic(), set(targets))
+            for ws in targets:
                 try:
                     await ws.send(cmd)
                 except Exception:
                     pass
         try:
-            asyncio.run_coroutine_threadsafe(send_to_all(), loop)
+            asyncio.run_coroutine_threadsafe(_send(), loop)
         except RuntimeError:
-            pass
+            return False
+        return True
 
     def stop(self):
         self.is_running = False

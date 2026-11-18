@@ -22,6 +22,7 @@ import pyautogui
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 from comtypes import CLSCTX_ALL, CoInitialize
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from config import yt_command_for_action, yt_command_for_rotation
 from utils import (win_key_event, win_hotkey, win_hotkey_down, win_hotkey_up,
                    send_unicode_text, move_mouse_abs, set_monitor_brightness, get_monitor_brightness)
 
@@ -50,6 +51,8 @@ def _accel_from_flags(flags):
 class ActionExecutor(QObject):
     # Фактична яскравість монітора (з воркера яскравості -> GUI-потік)
     brightness_synced = Signal(float)
+    # Фізична дія на платі (для підсвітки в макеті): (кнопка/енкодер, "press"|"release"|"left"|"right")
+    hw_activity = Signal(str, str)
     # Якщо яскравість довго не чіпали, перед наступною зміною її перечитуємо з монітора
     # (її могли змінити кнопками самого монітора чи іншою програмою)
     BRIGHTNESS_RESYNC_SEC = 20.0
@@ -73,6 +76,7 @@ class ActionExecutor(QObject):
 
         # Таймінги обертання енкодерів для Encoder Acceleration
         self._enc_last_tick = {}
+        self._yt_warned_at = 0.0
 
         # Послідовний воркер для емуляції вводу та COM
         self._input_q = queue.Queue()
@@ -269,6 +273,9 @@ class ActionExecutor(QObject):
             if not hw_already_fired:
                 self._inject(win_hotkey, "ctrl+y" if is_r else "ctrl+z")
 
+        elif act.startswith("ENC:YT_"):
+            self._send_yt(yt_command_for_rotation(act, is_r, accel))
+
         elif act.startswith("ENC:APP:"):
             step = 0.03 * accel
             target = act.split(":")[-1].lower()
@@ -328,6 +335,7 @@ class ActionExecutor(QObject):
                 if base.endswith(sfx):
                     enc = base[:-len(sfx)]
                     if enc in ENC_IDS:
+                        self.hw_activity.emit(enc, "right" if is_r else "left")
                         self._handle_rotation(enc, is_r, hw, _accel_from_flags(flags) if proto >= 2 else None)
                     return
 
@@ -338,6 +346,7 @@ class ActionExecutor(QObject):
             else:
                 return
             if key in BUTTON_IDS:
+                self.hw_activity.emit(key, "press" if is_pressed else "release")
                 self._handle_button_event(key, is_pressed, not is_pressed, hw)
         except Exception:
             pass
@@ -726,16 +735,19 @@ class ActionExecutor(QObject):
             self._launch(subprocess.Popen, act.split(":", 1)[1], shell=True)
 
         elif act.startswith("EXT:"):
-            parts = act.split(":")
-            ws = getattr(self.app, "ws_thread", None)
-            if ws is None:
-                return
-            if parts[1] == "YT_FWD":
-                ws.send_command(f"YT_FWD:{parts[2] if len(parts) > 2 else '10'}")
-            elif parts[1] == "YT_BACK":
-                ws.send_command(f"YT_BACK:{parts[2] if len(parts) > 2 else '10'}")
-            elif parts[1] == "YT_PLAYPAUSE":
-                ws.send_command("YT_PLAYPAUSE")
+            self._send_yt(yt_command_for_action(act))
+
+    def _send_yt(self, cmd):
+        """Надсилає команду розширенню браузера; якщо воно не підключене — каже про це."""
+        if not cmd:
+            return
+        ws = getattr(self.app, "ws_thread", None)
+        sent = bool(ws is not None and ws.send_command(cmd))
+        if not sent:
+            now = time.monotonic()
+            if now - self._yt_warned_at > 3.0:
+                self._yt_warned_at = now
+                self.app.trigger_osd("status", "Розширення YouTube не підключене", is_danger=True, icon_text="youtube")
 
     @staticmethod
     def _normalize_url(url):
